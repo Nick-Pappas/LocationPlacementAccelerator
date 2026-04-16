@@ -91,159 +91,163 @@ And also using Better Continents and Expand World Size, setting the radius to 17
 =================================================
 ===      WORLD GENERATION SUMMARY             ===
 =================================================
-  Total Time:       **27m 39.7s**
-  Total Requested:  17,391
-  Total Placed:     16,849  (**96.88%**)
-  Total Failed:     **542**
-       ----------------
-        Complete failures:
-        **-Hildir_cave : 0/3** *<--this makes the world unplayable*
-        -MWL_MeadowsWall1 : 0/10
-        -MWL_SwampCourtyard1 : 0/5
-        -MWL_SwampBrokenTower1 : 0/15
-        -MWL_SwampBrokenTower3 : 0/10
-       ----------------
-        Partial failures:
-        -Grave1 : 135/200
-        -SwampRuin2 : 28/30
-        -SwampHut2 : 26/50
-        -SwampHut3 : 21/50
-        -StoneTowerRuins04 : 36/50
-        -StoneTowerRuins05 : 5/50
-        -AshlandsCave_01 : 5/7
-        -AshlandsCave_02 : 4/7
-        -Vegvisir_location_Vrykolathas_TW : 2/12
-        -DemonPortal_TW : 1/3
-        -DeepNorth_SurtrCamp_TW : 6/25
-        -FortressRuins : 34/100
-        -DevWallAsh : 3/5
-        -VegvisirSwamp_RtD : 15/24
-        -MountainAltar_RtD : 69/80
-        -MistlandsAltar_RtD : 74/80
-        -MWL_Ruins3 : 1/25
-        -MWL_RuinsArena1 : 10/25
-        -MWL_RuinsArena3 : 6/25
-        -MWL_RuinsChurch1 : 9/25
-        -MWL_MeadowsHouse2 : 14/20
-        -MWL_MeadowsTower1 : 12/15
-        -MWL_OakHut1 : 12/15
-        -MWL_MeadowsLighthouse1 : 9/10
-        -MWL_MeadowsSawmill1 : 1/10
-        -MWL_MeadowsTavern1 : 3/10
-        -MWL_RuinsTower3 : 3/15
-        -MWL_RuinsTower8 : 1/10
-        -MWL_ForestTower2 : 9/20
-        -MWL_MassGrave1 : 9/15
-        -MWL_RootRuins1 : 1/15
-        -MWL_ForestTower5 : 7/15
-        -MWL_SwampRuin1 : 17/25
-        -MWL_AbandonedHouse1 : 9/15
-        -MWL_Belmont1 : 4/5
-        -MWL_StoneCircle1 : 7/10
-        -MWL_SwampTemple1 : 1/10
-  **Playability:      UNPLAYABLE**
-=================================================
+
+      Total Time:       **27m 39.7s**
+      Total Requested:  17,391
+      Total Placed:     16,849  (**96.88%**)
+      Total Failed:     **542**
+           ----------------
+            Complete failures:
+            **-Hildir_cave : 0/3** *<--this makes the world unplayable*
+            -MWL_MeadowsWall1 : 0/10
+            -MWL_SwampCourtyard1 : 0/5
+            -MWL_SwampBrokenTower1 : 0/15
+            -MWL_SwampBrokenTower3 : 0/10
+           ----------------
+            Partial failures:
+            -Grave1 : 135/200
+            -SwampRuin2 : 28/30
+            -SwampHut2 : 26/50
+            -SwampHut3 : 21/50
+            -StoneTowerRuins04 : 36/50
+            -StoneTowerRuins05 : 5/50
+            -AshlandsCave_01 : 5/7
+            -AshlandsCave_02 : 4/7
+            -Vegvisir_location_Vrykolathas_TW : 2/12
+            -DemonPortal_TW : 1/3
+            -DeepNorth_SurtrCamp_TW : 6/25
+            -FortressRuins : 34/100
+            -DevWallAsh : 3/5
+            -VegvisirSwamp_RtD : 15/24
+            -MountainAltar_RtD : 69/80
+            -MistlandsAltar_RtD : 74/80
+            -MWL_Ruins3 : 1/25
+            -MWL_RuinsArena1 : 10/25
+            -MWL_RuinsArena3 : 6/25
+            -MWL_RuinsChurch1 : 9/25
+            -MWL_MeadowsHouse2 : 14/20
+            -MWL_MeadowsTower1 : 12/15
+            -MWL_OakHut1 : 12/15
+            -MWL_MeadowsLighthouse1 : 9/10
+            -MWL_MeadowsSawmill1 : 1/10
+            -MWL_MeadowsTavern1 : 3/10
+            -MWL_RuinsTower3 : 3/15
+            -MWL_RuinsTower8 : 1/10
+            -MWL_ForestTower2 : 9/20
+            -MWL_MassGrave1 : 9/15
+            -MWL_RootRuins1 : 1/15
+            -MWL_ForestTower5 : 7/15
+            -MWL_SwampRuin1 : 17/25
+            -MWL_AbandonedHouse1 : 9/15
+            -MWL_Belmont1 : 4/5
+            -MWL_StoneCircle1 : 7/10
+            -MWL_SwampTemple1 : 1/10
+      **Playability:      UNPLAYABLE**
+    =================================================
 
 
 * *LPA Survey Mode (Single-Threaded):* 
 =================================================
 ===      WORLD GENERATION SUMMARY             ===
 =================================================
-  Total Time:       **3m 45.0s**
-  Total Requested:  17,391
-  Total Placed:     16,935  (**97.38%**)
-  Total Failed:     **456**
-       ----------------
-        Complete failures:
-        -MWL_Ruins1 : 0/5
-        -MWL_MeadowsRuin1 : 0/5
-        -MWL_SwampGrave1 : 0/25
-        -MWL_SwampCourtyard1 : 0/5
-        -MWL_SwampBrokenTower1 : 0/15
-       ----------------
-        Partial failures:
-        -Grave1 : 67/200
-        -StoneTowerRuins04 : 9/50
-        -StoneTowerRuins05 : 49/50
-        -ShipWreck01 : 2/25
-        -ShipWreck02 : 11/25
-        -Vegvisir_location_Vrykolathas_TW : 10/12
-        -AltarStormHerald_TW : 1/2
-        -Vegvisir_location_Gorr_TW : 2/3
-        -DeepNorth_SurtrCamp_TW : 6/25
-        -Hildir_cave : 1/3
-        -FaderLocation : 3/5
-        -MWL_Ruins2 : 4/10
-        -MWL_Ruins3 : 5/25
-        -MWL_Ruins7 : 1/2
-        -MWL_RuinsArena1 : 13/25
-        -MWL_RuinsArena3 : 12/25
-        -MWL_RuinsChurch1 : 18/25
-        -MWL_MeadowsHouse2 : 4/20
-        -MWL_MeadowsTower1 : 8/15
-        -MWL_SmallHouse1 : 13/20
-        -MWL_MeadowsFarm1 : 2/10
-        -MWL_MeadowsLighthouse1 : 1/10
-        -MWL_MeadowsSawmill1 : 2/10
-        -MWL_RuinsCastle1 : 1/15
-        -MWL_ForestTower2 : 9/20
-        -MWL_MassGrave1 : 9/15
-        -MWL_ForestTower5 : 8/15
-        -MWL_SwampBrokenTower3 : 1/10
-        -MWL_StoneCircle1 : 9/10
-  **Playability:      Playable**
-**-------------------------------------------------**
-  Relaxations Applied:
- **- Hildir_cave (Relaxed 1x: MinAlt: 200->190)**
-**=================================================**
+
+      Total Time:       **3m 45.0s**
+      Total Requested:  17,391
+      Total Placed:     16,935  (**97.38%**)
+      Total Failed:     **456**
+           ----------------
+            Complete failures:
+            -MWL_Ruins1 : 0/5
+            -MWL_MeadowsRuin1 : 0/5
+            -MWL_SwampGrave1 : 0/25
+            -MWL_SwampCourtyard1 : 0/5
+            -MWL_SwampBrokenTower1 : 0/15
+           ----------------
+            Partial failures:
+            -Grave1 : 67/200
+            -StoneTowerRuins04 : 9/50
+            -StoneTowerRuins05 : 49/50
+            -ShipWreck01 : 2/25
+            -ShipWreck02 : 11/25
+            -Vegvisir_location_Vrykolathas_TW : 10/12
+            -AltarStormHerald_TW : 1/2
+            -Vegvisir_location_Gorr_TW : 2/3
+            -DeepNorth_SurtrCamp_TW : 6/25
+            -Hildir_cave : 1/3
+            -FaderLocation : 3/5
+            -MWL_Ruins2 : 4/10
+            -MWL_Ruins3 : 5/25
+            -MWL_Ruins7 : 1/2
+            -MWL_RuinsArena1 : 13/25
+            -MWL_RuinsArena3 : 12/25
+            -MWL_RuinsChurch1 : 18/25
+            -MWL_MeadowsHouse2 : 4/20
+            -MWL_MeadowsTower1 : 8/15
+            -MWL_SmallHouse1 : 13/20
+            -MWL_MeadowsFarm1 : 2/10
+            -MWL_MeadowsLighthouse1 : 1/10
+            -MWL_MeadowsSawmill1 : 2/10
+            -MWL_RuinsCastle1 : 1/15
+            -MWL_ForestTower2 : 9/20
+            -MWL_MassGrave1 : 9/15
+            -MWL_ForestTower5 : 8/15
+            -MWL_SwampBrokenTower3 : 1/10
+            -MWL_StoneCircle1 : 9/10
+      **Playability:      Playable**
+    **-------------------------------------------------**
+      Relaxations Applied:
+     **- Hildir_cave (Relaxed 1x: MinAlt: 200->190)**
+    **=================================================**
 
 
 * *LPA Survey Mode (Multithreaded):* 
 =================================================
 ===      WORLD GENERATION SUMMARY             ===
 =================================================
-  Total Time:       **0m 36.6s**
-  Total Requested:  17,391
-  Total Placed:     16,986  (**97.67%**)
-  Total Failed:     **405**
-       ----------------
-        Complete failures:
-        -MWL_Ruins1 : 0/5
-        -MWL_RuinsCastle1 : 0/15
-       ----------------
-        Partial failures:
-        -Grave1 : 87/200
-        -SwampHut2 : 43/50
-        -StoneTowerRuins04 : 9/50
-        -StoneTowerRuins05 : 48/50
-        -ShipWreck01 : 3/25
-        -ShipWreck02 : 6/25
-        -Vegvisir_location_Vrykolathas_TW : 10/12
-        -DeepNorth_SurtrCamp_TW : 8/25
-        -Hildir_cave : 1/3
-        -MWL_Ruins2 : 1/10
-        -MWL_Ruins3 : 9/25
-        -MWL_Ruins7 : 1/2
-        -MWL_RuinsArena1 : 6/25
-        -MWL_RuinsArena3 : 10/25
-        -MWL_RuinsChurch1 : 14/25
-        -MWL_MeadowsHouse2 : 11/20
-        -MWL_MeadowsFarm1 : 3/10
-        -MWL_MeadowsLighthouse1 : 1/10
-        -MWL_MeadowsSawmill1 : 3/10
-        -MWL_MeadowsWall1 : 8/10
-        -MWL_RuinsTower3 : 13/15
-        -MWL_ForestTower2 : 10/20
-        -MWL_MassGrave1 : 14/15
-        -MWL_SwampGrave1 : 3/25
-        -MWL_Belmont1 : 2/5
-        -MWL_SwampBrokenTower1 : 4/15
-        -MWL_SwampBrokenTower3 : 4/10
-  Playability:      Playable
-**-------------------------------------------------**
-  Relaxations Applied:
-**- Hildir_cave (Relaxed 1x: MinAlt: 200->190)**
-**=================================================**
+ 
+
+     Total Time:       **0m 36.6s**
+      Total Requested:  17,391
+      Total Placed:     16,986  (**97.67%**)
+      Total Failed:     **405**
+           ----------------
+            Complete failures:
+            -MWL_Ruins1 : 0/5
+            -MWL_RuinsCastle1 : 0/15
+           ----------------
+            Partial failures:
+            -Grave1 : 87/200
+            -SwampHut2 : 43/50
+            -StoneTowerRuins04 : 9/50
+            -StoneTowerRuins05 : 48/50
+            -ShipWreck01 : 3/25
+            -ShipWreck02 : 6/25
+            -Vegvisir_location_Vrykolathas_TW : 10/12
+            -DeepNorth_SurtrCamp_TW : 8/25
+            -Hildir_cave : 1/3
+            -MWL_Ruins2 : 1/10
+            -MWL_Ruins3 : 9/25
+            -MWL_Ruins7 : 1/2
+            -MWL_RuinsArena1 : 6/25
+            -MWL_RuinsArena3 : 10/25
+            -MWL_RuinsChurch1 : 14/25
+            -MWL_MeadowsHouse2 : 11/20
+            -MWL_MeadowsFarm1 : 3/10
+            -MWL_MeadowsLighthouse1 : 1/10
+            -MWL_MeadowsSawmill1 : 3/10
+            -MWL_MeadowsWall1 : 8/10
+            -MWL_RuinsTower3 : 13/15
+            -MWL_ForestTower2 : 10/20
+            -MWL_MassGrave1 : 14/15
+            -MWL_SwampGrave1 : 3/25
+            -MWL_Belmont1 : 2/5
+            -MWL_SwampBrokenTower1 : 4/15
+            -MWL_SwampBrokenTower3 : 4/10
+      Playability:      Playable
+    **-------------------------------------------------**
+      Relaxations Applied:
+    **- Hildir_cave (Relaxed 1x: MinAlt: 200->190)**
+    **=================================================**
 
 
 
