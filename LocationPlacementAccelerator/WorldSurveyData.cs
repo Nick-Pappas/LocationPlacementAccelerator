@@ -1,0 +1,373 @@
+// v1
+/**
+* Pre-scans the entire world grid in parallel, building a flat ZoneProfile[]
+* array with packed biome/area/distance bitmasks per zone. Also performs
+* coastal tagging (zones adjacent to ocean get CoastalBit set) and logs
+* the biome distribution summary.
+*
+* Grid[] is the authoritative zone data source for LT bucketing.
+* ZoneToIndex maps Vector2i --> flat array index.
+* OccupiedZoneIndices tracks zones that already have a location placed.
+* Here is where the magic happens. 
+*/
+#nullable disable
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using UnityEngine;
+
+namespace LPA
+{
+    public static class WorldSurveyData
+    {
+        public const int BiomeBoilingOcean = 1 << 16;
+        public const int CoastalBit = 1 << 17;
+        public const int OceanFlags = (int)Heightmap.Biome.Ocean | BiomeBoilingOcean;
+        public const int LandBiomeMask = ((1 << 17) - 1) & ~OceanFlags;
+
+        public static ZoneProfile[] Grid { get; private set; }
+        public static Dictionary<Vector2i, int> ZoneToIndex { get; private set; } = new Dictionary<Vector2i, int>();
+        public static HashSet<int> OccupiedZoneIndices { get; private set; } = new HashSet<int>();
+
+        private static bool _initialized = false;
+        private static int _scanRowsDone = 0;
+        private static int _scanTotalRows = 0;
+
+        public static float SurveyProgress
+        {
+            get
+            {
+                if (_scanTotalRows <= 0)
+                {
+                    return 0f;
+                }
+                return Math.Min(1f, (float)_scanRowsDone / _scanTotalRows);
+            }
+        }
+
+        public static void Initialize()
+        {
+            if (_initialized)
+            {
+                return;
+            }
+            ScanEntireWorld();
+            _initialized = true;
+        }
+
+        public static void Reset()
+        {
+            _initialized = false;
+            _scanRowsDone = 0;
+            _scanTotalRows = 0;
+        }
+
+        private static void ScanEntireWorld()
+        {
+            int gridSize = ModConfig.SurveyScanResolution.Value;
+            float worldRadius = ModConfig.WorldRadius;
+            DiagnosticLog.WriteTimestampedLog($"Phase A: Starting Survey (Resolution {gridSize}x{gridSize}, Parallel Init)...");
+
+            System.Diagnostics.Stopwatch stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            int radiusZones = (int)(worldRadius / 64f);
+            int diameter = radiusZones * 2 + 1;
+
+            List<ZoneProfile>[] localProfiles = new List<ZoneProfile>[diameter];
+            float[] localMinAlt = new float[diameter];
+            float[] localMaxAlt = new float[diameter];
+
+            float[] offsets = GetSampleOffsets(gridSize);
+
+            int workerCount = Math.Max(1, Environment.ProcessorCount - 2);
+            DiagnosticLog.WriteTimestampedLog(
+                $"[Survey] Using {workerCount} worker threads (logical CPUs: {Environment.ProcessorCount}).");
+
+            _scanRowsDone = 0;
+            _scanTotalRows = diameter;
+            ParallelOptions pOpts = new ParallelOptions { MaxDegreeOfParallelism = workerCount };
+
+            Parallel.For(0, diameter, pOpts, (int iP) =>
+            {
+                int y = iP - radiusZones;
+                localProfiles[iP] = new List<ZoneProfile>();
+
+                localMinAlt[iP] = float.MaxValue;
+                localMaxAlt[iP] = float.MinValue;
+
+                for (int x = -radiusZones; x <= radiusZones; x++)
+                {
+                    if (x * x + y * y > radiusZones * radiusZones)
+                    {
+                        continue;
+                    }
+
+                    Vector2i id = new Vector2i(x, y);
+                    Vector3 center = ZoneSystem.GetZonePos(id);
+                    float rawH = WorldGenerator.instance.GetHeight(center.x, center.z);
+                    float normH = rawH - 30.0f;
+
+                    if (normH < localMinAlt[iP])
+                    {
+                        localMinAlt[iP] = normH;
+                    }
+                    if (normH > localMaxAlt[iP])
+                    {
+                        localMaxAlt[iP] = normH;
+                    }
+
+                    int bMask = GetBiomeMask(center, gridSize, offsets);
+
+                    // AshLands zones below sea level are reclassified as BiomeBoilingOcean so they match AshLands underwater location types during candidate scan.
+                    bool isAshLands = (bMask & (int)Heightmap.Biome.AshLands) != 0;
+                    if (isAshLands && normH < -4.0f)
+                    {
+                        bMask &= ~(int)Heightmap.Biome.AshLands;
+                        bMask |= BiomeBoilingOcean;
+                    }
+
+                    int aMask = GetAreaMask(center, gridSize, offsets);
+                    ushort distMask = GetDistanceMask(center, worldRadius);
+
+                    localProfiles[iP].Add(new ZoneProfile { ID = id, BiomeMask = bMask, AreaMask = aMask, DistanceMask = distMask });
+                }
+                Interlocked.Increment(ref _scanRowsDone);
+            });
+
+            TelemetryHelpers.GlobalMinAltitudeSeen = float.MaxValue;
+            TelemetryHelpers.GlobalMaxAltitudeSeen = float.MinValue;
+
+            List<ZoneProfile> tempList = new List<ZoneProfile>();
+            ZoneToIndex.Clear();
+            OccupiedZoneIndices.Clear();
+
+            int indexCounter = 0;
+
+            for (int i = 0; i < diameter; i++)
+            {
+                if (localMinAlt[i] < TelemetryHelpers.GlobalMinAltitudeSeen)
+                {
+                    TelemetryHelpers.GlobalMinAltitudeSeen = localMinAlt[i];
+                }
+                if (localMaxAlt[i] > TelemetryHelpers.GlobalMaxAltitudeSeen)
+                {
+                    TelemetryHelpers.GlobalMaxAltitudeSeen = localMaxAlt[i];
+                }
+
+                if (localProfiles[i] != null)
+                {
+                    for (int j = 0; j < localProfiles[i].Count; j++)
+                    {
+                        ZoneProfile profile = localProfiles[i][j];
+                        tempList.Add(profile);
+                        ZoneToIndex[profile.ID] = indexCounter++;
+                    }
+                }
+            }
+
+            Grid = tempList.ToArray();
+
+            // Coastal Tagging: tag any zone adjacent to an ocean/land boundary.
+            {
+                int[] coastMap = new int[diameter * diameter];
+                for (int gi = 0; gi < Grid.Length; gi++)
+                {
+                    ZoneProfile z = Grid[gi];
+                    coastMap[(z.ID.y + radiusZones) * diameter + (z.ID.x + radiusZones)] = z.BiomeMask;
+                }
+
+                int coastalTagged = 0;
+                for (int gi = 0; gi < Grid.Length; gi++)
+                {
+                    if ((Grid[gi].AreaMask & (int)Heightmap.BiomeArea.Edge) == 0) continue;
+                    int bm = Grid[gi].BiomeMask;
+                    bool isOcean = (bm & OceanFlags) != 0;
+                    bool isLand = (bm & LandBiomeMask) != 0;
+                    if (!isOcean && !isLand)
+                    {
+                        continue;
+                    }
+
+                    int cx = Grid[gi].ID.x + radiusZones;
+                    int cy = Grid[gi].ID.y + radiusZones;
+                    bool tagged = false;
+
+                    for (int dx = -1; dx <= 1 && !tagged; dx++)
+                    {
+                        for (int dz = -1; dz <= 1 && !tagged; dz++)
+                        {
+                            if (dx == 0 && dz == 0)
+                            {
+                                continue;
+                            }
+                            int nx = cx + dx;
+                            int ny = cy + dz;
+                            if ((uint)nx >= (uint)diameter || (uint)ny >= (uint)diameter)
+                            {
+                                continue;
+                            }
+                            int nb = coastMap[ny * diameter + nx];
+                            if (nb == 0)
+                            {
+                                continue;
+                            }
+
+                            if (isOcean && (nb & LandBiomeMask) != 0)
+                            {
+                                tagged = true;
+                            }
+                            else if (isLand && (nb & (int)Heightmap.Biome.Ocean) != 0)
+                            {
+                                tagged = true;
+                            }
+                        }
+                    }
+
+                    if (tagged)
+                    {
+                        Grid[gi].BiomeMask |= CoastalBit;
+                        coastalTagged++;
+                    }
+                }
+
+                DiagnosticLog.WriteTimestampedLog(
+                    $"[Survey] Coastal tagging: {coastalTagged:N0} of {Grid.Length:N0} zones tagged.");
+            }
+
+            stopwatch.Stop();
+            LogSurveySummary(stopwatch.ElapsedMilliseconds);
+        }
+
+        private static float[] GetSampleOffsets(int gridSizeP)
+        {
+            if (gridSizeP <= 1)
+            {
+                return new[] { 0f };
+            }
+            float[] offsets = new float[gridSizeP];
+            float safeExtent = 30f;
+            float step = (safeExtent * 2f) / (gridSizeP - 1);
+            for (int i = 0; i < gridSizeP; i++)
+            {
+                offsets[i] = -safeExtent + (i * step);
+            }
+            return offsets;
+        }
+
+        private static int GetBiomeMask(Vector3 zoneCenterP, int gridSizeP, float[] offsetsP)
+        {
+            int mask = 0;
+            for (int ox = 0; ox < gridSizeP; ox++)
+            {
+                for (int oz = 0; oz < gridSizeP; oz++)
+                {
+                    mask |= (int)WorldGenerator.instance.GetBiome(new Vector3(zoneCenterP.x + offsetsP[ox], 0, zoneCenterP.z + offsetsP[oz]));
+                }
+            }
+            return mask;
+        }
+
+        private static int GetAreaMask(Vector3 zoneCenterP, int gridSizeP, float[] offsetsP)
+        {
+            int mask = 0;
+            for (int ox = 0; ox < gridSizeP; ox++)
+            {
+                for (int oz = 0; oz < gridSizeP; oz++)
+                {
+                    mask |= (int)WorldGenerator.instance.GetBiomeArea(new Vector3(zoneCenterP.x + offsetsP[ox], 0, zoneCenterP.z + offsetsP[oz]));
+                }
+            }
+            return mask;
+        }
+
+        /**
+        * Packs the zone's distance from origin into a 10-bit mask where each bit
+        * represents a 10% shell of the world radius. A zone whose center is at
+        * distance d gets bits set for [floor((d-halfDiag)/wr*10), ceil((d+halfDiag)/wr*10)]
+        * so that distance-range filtering can be done with a single bitwise AND.
+        * I used 10 bits because most locations work in 0.1*k increments.
+        * i.e. they say e.g. "from 0.3 to 0.7 of world radius" (it is normalized). 
+        * So 10 bits is enough.
+        */
+        private static ushort GetDistanceMask(Vector3 zoneCenterP, float worldRadiusP)
+        {
+            float dist = zoneCenterP.magnitude;
+            const float halfDiag = 45.25f;
+            int minBit = (int)Mathf.Max(0, (dist - halfDiag) / worldRadiusP * 10f);
+            int maxBit = (int)Mathf.Min(9, (dist + halfDiag) / worldRadiusP * 10f);
+            ushort mask = 0;
+            for (int i = minBit; i <= maxBit; i++)
+            {
+                mask |= (ushort)(1 << i);
+            }
+            return mask;
+        }
+
+        private static void LogSurveySummary(long msP)
+        {
+            DiagnosticLog.WriteTimestampedLog($"Survey initialization completed in: {msP}ms.");
+
+            Dictionary<int, int> biomeCounts = new Dictionary<int, int>();
+
+            for (int gi = 0; gi < Grid.Length; gi++)
+            {
+                int bm = Grid[gi].BiomeMask;
+
+                for (int bit = 0; bit < 17; bit++)
+                {
+                    int flag = 1 << bit;
+                    if ((bm & flag) != 0)
+                    {
+                        bool hasCount = biomeCounts.TryGetValue(flag, out int count);
+                        if (!hasCount)
+                        {
+                            count = 0;
+                        }
+                        biomeCounts[flag] = count + 1;
+                    }
+                }
+                if ((bm & BiomeBoilingOcean) != 0)
+                {
+                    bool hasCount = biomeCounts.TryGetValue(BiomeBoilingOcean, out int count);
+                    if (!hasCount)
+                    {
+                        count = 0;
+                    }
+                    biomeCounts[BiomeBoilingOcean] = count + 1;
+                }
+            }
+
+            DiagnosticLog.WriteLog("Biome Distribution:");
+            List<KeyValuePair<int, int>> sorted = new List<KeyValuePair<int, int>>(biomeCounts);
+            sorted.Sort((KeyValuePair<int, int> aP, KeyValuePair<int, int> bP) => bP.Value.CompareTo(aP.Value));
+
+            foreach (KeyValuePair<int, int> kvp in sorted)
+            {
+                if (kvp.Value == 0)
+                {
+                    continue;
+                }
+                string name = ((Heightmap.Biome)kvp.Key).ToString();
+                if (kvp.Key == BiomeBoilingOcean)
+                {
+                    name = "AshLands (Boiling Ocean)";
+                }
+                else if (kvp.Key == (int)Heightmap.Biome.AshLands)
+                {
+                    name = "AshLands (Land)";
+                }
+                DiagnosticLog.WriteLog($"   - {name,-25}: {kvp.Value,7:N0} zones");
+            }
+            DiagnosticLog.WriteLog("");
+
+            if (TelemetryHelpers.GlobalMaxAltitudeSeen > float.MinValue)
+            {
+                DiagnosticLog.WriteLog($"World Altitude Profile: Min {TelemetryHelpers.GlobalMinAltitudeSeen:F1}m, Max {TelemetryHelpers.GlobalMaxAltitudeSeen:F1}m");
+                DiagnosticLog.WriteLog("");
+            }
+
+            DiagnosticLog.WriteTimestampedLog($"Placement Starts! Total locations to be placed: {GenerationProgress.TotalRequested}");
+            DiagnosticLog.WriteLog("");
+        }
+    }
+}

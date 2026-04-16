@@ -1,0 +1,565 @@
+// v1
+/**
+* Generation lifecycle management, placement counters, and UI text building.
+* Coordinates between placement engines, diagnostics, and the progress overlay.
+*
+* Counter threading model:
+*   _currentProcessed / _currentPlaced: written by worker threads via
+*   Interlocked.Add, read by GUI thread each OnGUI frame. Volatile ensures
+*   the GUI sees the latest value without needing a lock.
+*   
+* Could I have split this into multiple classes? Should I? Maybe. 
+* But there's a lot of shared state and I don't want to risk synchronization bugs
+* by scattering it across multiple classes. 
+* One has to pick their battles.
+*/
+#nullable disable
+using BepInEx.Logging;
+using System;
+using System.Collections.Generic;
+using System.Text;
+using UnityEngine;
+using static ZoneSystem;
+
+namespace LPA
+{
+    public static class GenerationProgress
+    {
+        private static bool _initialized = false;
+        private static int _totalRequested = 0;
+        private static volatile int _currentProcessed = 0;
+        private static volatile int _currentPlaced = 0;
+        private static string _modeName = "Vanilla";
+        private static DateTime _startTime;
+
+        private static bool _isSurveying = false;
+
+        public static bool IsSurveying
+        {
+            get
+            {
+                return _isSurveying;
+            }
+        }
+
+        public static ZoneSystem.ZoneLocation CurrentLocation = null;
+
+        public static string StaticTopText = "";
+        public static string StaticBottomText = "";
+
+        private static volatile string[] _threadSlots = null;
+
+        public static string[] ThreadSlots
+        {
+            get
+            {
+                return _threadSlots;
+            }
+        }
+
+        public static int ThreadSlotCount
+        {
+            get
+            {
+                string[] slots = _threadSlots;
+                if (slots == null)
+                {
+                    return 0;
+                }
+                return slots.Length;
+            }
+        }
+
+        public static int TotalRequested
+        {
+            get
+            {
+                return _totalRequested;
+            }
+        }
+
+        public static int CurrentProcessed
+        {
+            get
+            {
+                return _currentProcessed;
+            }
+        }
+
+        public static int CurrentPlaced
+        {
+            get
+            {
+                return _currentPlaced;
+            }
+        }
+
+        private static List<ZoneLocation> _validLocations = new List<ZoneLocation>();
+
+        public static void InitThreadSlots(int countP)
+        {
+            _threadSlots = new string[countP];
+        }
+
+        // Workers call this to announce which prefab they're currently placing.
+        // null = slot is idle. Each slot is owned by exactly one thread at a time.
+        public static void SetThreadSlot(int slotIndexP, string prefabNameP)
+        {
+            string[] slots = _threadSlots;
+            if (slots == null || slotIndexP < 0 || slotIndexP >= slots.Length)
+            {
+                return;
+            }
+            System.Threading.Volatile.Write(ref slots[slotIndexP], prefabNameP);
+        }
+
+        public static void ClearThreadSlots()
+        {
+            _threadSlots = null;
+        }
+
+        private static string BuildModeName()
+        {
+            bool legacy = ModConfig.EffectiveLegacy;
+            PlacementMode mode = ModConfig.EffectiveMode;
+
+            string modeStr;
+            switch (mode)
+            {
+                case PlacementMode.Survey: modeStr = "Survey"; break;
+                case PlacementMode.Filter: modeStr = "Filter"; break;
+                case PlacementMode.Force:  modeStr = "Force";  break;
+                default:                   modeStr = "Vanilla"; break;
+            }
+
+            string engineLabel = legacy ? "Transpiled" : "Replaced";
+            bool parallel = !legacy && ModConfig.EnableParallelPlacement.Value;
+            if (parallel)
+            {
+                return $"{engineLabel} - {modeStr} - Parallel";
+            }
+            return $"{engineLabel} - {modeStr}";
+        }
+
+        public static void StartGeneration(ZoneSystem zsP)
+        {
+            if (_initialized)
+            {
+                return;
+            }
+            _initialized = true;
+
+            if (ModConfig.ShowGui.Value)
+            {
+                ProgressOverlay.EnsureInstance();
+            }
+            ConstraintRelaxer.Reset();
+
+            DiagnosticLog.OpenLogFile();
+            DiagnosticLog.OnWorldRadiusResolved();
+
+            _modeName = BuildModeName();
+
+            _validLocations.Clear();
+
+            List<ZoneLocation> sourceList = zsP.m_locations;
+            if (Interleaver.OriginalLocations != null)
+            {
+                sourceList = Interleaver.OriginalLocations;
+            }
+            foreach (ZoneLocation loc in sourceList)
+            {
+                if (loc.m_enable && loc.m_prefab != null && loc.m_prefab.IsValid)
+                {
+                    _validLocations.Add(loc);
+                }
+            }
+
+            int total = 0;
+            for (int i = 0; i < _validLocations.Count; i++)
+            {
+                total += _validLocations[i].m_quantity;
+            }
+            _totalRequested = total;
+            _currentProcessed = 0;
+            _currentPlaced = 0;
+            RelaxationTracker.Reset();
+
+            UpdateText();
+        }
+
+        public static void MarkActualStart()
+        {
+            _startTime = DateTime.Now;
+            DiagnosticLog.WriteTimestampedLog($"=== GLOBAL START: Generating Locations ({_modeName}) ===");
+
+            if (ModConfig.EffectiveMode == PlacementMode.Survey)
+            {
+                WorldSurveyData.Initialize();
+                SurveyMode.Initialize();
+            }
+        }
+
+        /**
+        * Replaced-engine variant: logs the start timestamp but does NOT run the survey.
+        * The replaced engine drives WorldSurveyData.Initialize() itself as a background
+        * Task so the main thread stays free to render the survey progress overlay.
+        */
+        public static void MarkActualStartNoSurvey()
+        {
+            _startTime = DateTime.Now;
+            bool parallel = ModConfig.EnableParallelPlacement.Value
+                         && !ModConfig.EffectiveLegacy;
+            DiagnosticLog.WriteTimestampedLog($"=== GLOBAL START: Generating Locations ({_modeName}) ===");
+            DiagnosticLog.WriteTimestampedLog($"  Multithreaded:        {(parallel ? "ON" : "OFF")}");
+        }
+
+        public static void BeginSurvey()
+        {
+            _isSurveying = true;
+        }
+
+        public static void EndSurvey()
+        {
+            _isSurveying = false;
+        }
+
+        public static void IncrementProcessed(bool successfullyPlacedP, int countP = 1)
+        {
+            _currentProcessed += countP;
+            if (successfullyPlacedP)
+            {
+                _currentPlaced += countP;
+            }
+            UpdateText();
+        }
+
+        public static void IncrementAttempted(int countP)
+        {
+            System.Threading.Interlocked.Add(ref _currentProcessed, countP);
+        }
+
+        public static void IncrementPlaced(int countP)
+        {
+            System.Threading.Interlocked.Add(ref _currentPlaced, countP);
+        }
+
+        private static int GetActualPlacedCount(string prefabNameP)
+        {
+            if (ZoneSystem.instance == null)
+            {
+                return 0;
+            }
+            int count = 0;
+            foreach (KeyValuePair<Vector2i, LocationInstance> kvp in ZoneSystem.instance.m_locationInstances)
+            {
+                if (kvp.Value.m_location.m_prefabName == prefabNameP)
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        public static void UpdateText()
+        {
+            if (ProgressOverlay.instance == null)
+            {
+                return;
+            }
+
+            RelaxationSnapshot snap = RelaxationTracker.GetSnapshot();
+
+            /**
+            * Text color scheme:
+            * 
+            * Green = no known failures, all placements successful so far.
+            * Red = at least one known failure that has not yet been rescued.
+            * Blue = all known failures have been rescued, but placement is still ongoing so more failures may be discovered.
+            *
+            * Blue fires as soon as all known failures are rescued - doesn't wait for
+            * placement to complete so the full GUI turns blue the moment relaxation succeeds.
+            */
+            string color;
+            if (snap.AnyRelaxationOccurred && !snap.AnyUnrescued)
+            {
+                color = "#55AAFF";
+            }
+            else if (snap.AnyUnrescued)
+            {
+                color = "#FF4444";
+            }
+            else
+            {
+                color = "#55FF55";
+            }
+
+            StringBuilder sbTop = new StringBuilder();
+            sbTop.AppendLine($"<color={color}>");
+            sbTop.AppendLine($"<size=28><b>Placing locations using {_modeName}</b></size>");
+            StaticTopText = sbTop.ToString();
+
+            StringBuilder sbBot = new StringBuilder();
+            sbBot.Append("</color>");
+
+            if (snap.Active.Count > 0)
+            {
+                sbBot.AppendLine("\n<color=#FF4444><size=22><b>FAILED - ATTEMPTING RELAXATION:</b></size>");
+                foreach (string name in snap.Active)
+                {
+                    bool hasAttempts = snap.AttemptLog.TryGetValue(name, out List<string> attempts);
+                    if (hasAttempts)
+                    {
+                        for (int i = 0; i < attempts.Count; i++)
+                        {
+                            sbBot.AppendLine($"<size=20>  {name}  {attempts[i]}</size>");
+                        }
+                    }
+                    else
+                    {
+                        sbBot.AppendLine($"<size=20>  {name}</size>");
+                    }
+                }
+                sbBot.Append("</color>");
+            }
+
+            if (snap.Succeeded.Count > 0)
+            {
+                sbBot.AppendLine("\n<color=#55AAFF><size=22><b>RELAXED CONSTRAINTS:</b></size>");
+                foreach (string name in snap.Succeeded)
+                {
+                    ZoneLocation locData = null;
+                    if (ZoneSystem.instance != null)
+                    {
+                        for (int i = 0; i < ZoneSystem.instance.m_locations.Count; i++)
+                        {
+                            if (ZoneSystem.instance.m_locations[i].m_prefabName == name)
+                            {
+                                locData = ZoneSystem.instance.m_locations[i];
+                                break;
+                            }
+                        }
+                    }
+                    if (locData != null)
+                    {
+                        sbBot.AppendLine($"<size=20>  {name}  {ConstraintRelaxer.GetRelaxationSummary(name, locData)}</size>");
+                    }
+                }
+                sbBot.Append("</color>");
+            }
+
+            if (snap.Exhausted.Count > 0)
+            {
+                sbBot.AppendLine("\n<color=#FF4444><size=22><b>FAILED - COULD NOT PLACE:</b></size>");
+                foreach (string name in snap.Exhausted)
+                {
+                    bool hasCount = ConstraintRelaxer.RelaxationAttempts.TryGetValue(name, out int cnt);
+                    int n = 0;
+                    if (hasCount)
+                    {
+                        n = cnt;
+                    }
+                    sbBot.AppendLine($"<size=20>  {name}  (exhausted {n} relaxation attempts)</size>");
+                }
+                sbBot.Append("</color>");
+            }
+
+            StaticBottomText = sbBot.ToString();
+        }
+
+        public static void EndGeneration()
+        {
+            if (!_initialized)
+            {
+                return;
+            }
+
+            DateTime endTime = DateTime.Now;
+            TimeSpan elapsedTime = endTime - _startTime;
+            string timeString = $"{(int)elapsedTime.TotalMinutes}m {elapsedTime.Seconds}.{elapsedTime.Milliseconds / 100}s";
+
+            DiagnosticLog.WriteBlankLine();
+            DiagnosticLog.WriteTimestampedLog($"=== GLOBAL END: Generating Locations ({_modeName}) ===");
+            DiagnosticLog.WriteBlankLine();
+
+            if (ZoneSystem.instance != null)
+            {
+                Interleaver.RestoreLocations(ZoneSystem.instance);
+
+                // Deduplicate m_locations in case relaxation packets created duplicates.
+                HashSet<ZoneLocation> seen = new HashSet<ZoneLocation>();
+                List<ZoneLocation> distinctList = new List<ZoneLocation>();
+                for (int i = 0; i < ZoneSystem.instance.m_locations.Count; i++)
+                {
+                    if (seen.Add(ZoneSystem.instance.m_locations[i]))
+                    {
+                        distinctList.Add(ZoneSystem.instance.m_locations[i]);
+                    }
+                }
+                ZoneSystem.instance.m_locations.Clear();
+                ZoneSystem.instance.m_locations.AddRange(distinctList);
+            }
+
+            ConstraintRelaxer.RestoreQuantities();
+
+            int totalActualPlaced = 0;
+            Dictionary<string, int> finalCounts = new Dictionary<string, int>();
+            foreach (ZoneLocation loc in _validLocations)
+            {
+                bool alreadyCounted = finalCounts.TryGetValue(loc.m_prefabName, out int existingCount);
+                if (!alreadyCounted)
+                {
+                    int count = GetActualPlacedCount(loc.m_prefabName);
+                    finalCounts[loc.m_prefabName] = count;
+                    totalActualPlaced += count;
+                }
+            }
+
+            List<string> completeFailures = new List<string>();
+            List<string> partialFailures = new List<string>();
+            List<string> missedNecessities = new List<string>();
+
+            // Track which prefab names I've already processed to skip duplicates.
+            HashSet<string> processedPrefabs = new HashSet<string>();
+            foreach (ZoneLocation loc in _validLocations)
+            {
+                if (!processedPrefabs.Add(loc.m_prefabName))
+                {
+                    continue;
+                }
+
+                int requested = loc.m_quantity;
+                if (requested <= 0)
+                {
+                    continue;
+                }
+
+                bool hasPlaced = finalCounts.TryGetValue(loc.m_prefabName, out int placed);
+                if (hasPlaced)
+                {
+                    if (placed == 0)
+                    {
+                        completeFailures.Add($"-{loc.m_prefabName} : {placed}/{requested}");
+                        if (PlayabilityPolicy.IsNecessity(loc.m_prefabName))
+                        {
+                            missedNecessities.Add(loc.m_prefabName);
+                        }
+                    }
+                    else if (placed < requested)
+                    {
+                        partialFailures.Add($"-{loc.m_prefabName} : {placed}/{requested}");
+                    }
+                }
+            }
+
+            string playabilityVerdict;
+            LogLevel logLevel;
+
+            List<KeyValuePair<string, int>> relaxedItems = new List<KeyValuePair<string, int>>();
+            foreach (KeyValuePair<string, int> kvp in ConstraintRelaxer.RelaxationAttempts)
+            {
+                if (kvp.Value > 0)
+                {
+                    relaxedItems.Add(kvp);
+                }
+            }
+
+            if (missedNecessities.Count > 0)
+            {
+                playabilityVerdict = "UNPLAYABLE";
+                logLevel = LogLevel.Error;
+            }
+            else
+            {
+                playabilityVerdict = "Playable";
+                logLevel = LogLevel.Info;
+                if (relaxedItems.Count > 0)
+                {
+                    logLevel = LogLevel.Warning;
+                }
+            }
+
+            int totalFailed = _totalRequested - totalActualPlaced;
+            if (totalFailed < 0)
+            {
+                totalFailed = 0;
+            }
+            float successRate = 100f;
+            if (_totalRequested > 0)
+            {
+                successRate = totalActualPlaced * 100f / _totalRequested;
+            }
+
+            StringBuilder summary = new StringBuilder();
+            summary.AppendLine("=================================================");
+            summary.AppendLine("===      WORLD GENERATION SUMMARY             ===");
+            summary.AppendLine("=================================================");
+            summary.AppendLine($"  Total Time:       {timeString}");
+            summary.AppendLine($"  Total Requested:  {_totalRequested:N0}");
+            summary.AppendLine($"  Total Placed:     {totalActualPlaced:N0}  ({successRate:F2}%)");
+            summary.AppendLine($"  Total Failed:     {totalFailed:N0}");
+
+            if (completeFailures.Count > 0)
+            {
+                summary.AppendLine("       ----------------");
+                summary.AppendLine("        Complete failures:");
+                for (int i = 0; i < completeFailures.Count; i++)
+                {
+                    summary.AppendLine($"        {completeFailures[i]}");
+                }
+            }
+            if (partialFailures.Count > 0)
+            {
+                summary.AppendLine("       ----------------");
+                summary.AppendLine("        Partial failures:");
+                for (int i = 0; i < partialFailures.Count; i++)
+                {
+                    summary.AppendLine($"        {partialFailures[i]}");
+                }
+            }
+
+            summary.AppendLine($"  Playability:      {playabilityVerdict}");
+
+            if (relaxedItems.Count > 0)
+            {
+                summary.AppendLine("-------------------------------------------------");
+                summary.AppendLine("  Relaxations Applied:");
+                foreach (KeyValuePair<string, int> kvp in relaxedItems)
+                {
+                    ZoneLocation locData = null;
+                    if (ZoneSystem.instance != null)
+                    {
+                        for (int i = 0; i < ZoneSystem.instance.m_locations.Count; i++)
+                        {
+                            if (ZoneSystem.instance.m_locations[i].m_prefabName == kvp.Key)
+                            {
+                                locData = ZoneSystem.instance.m_locations[i];
+                                break;
+                            }
+                        }
+                    }
+                    if (locData != null)
+                    {
+                        summary.AppendLine($"  - {kvp.Key} {ConstraintRelaxer.GetRelaxationSummary(kvp.Key, locData)}");
+                    }
+                }
+            }
+
+            summary.AppendLine("=================================================");
+
+            DiagnosticLog.WriteLog("\n" + summary.ToString().TrimEnd(), logLevel);
+
+            ProgressOverlay.DestroyInstance();
+            ThreadSafePRNG.Reset();
+            WorldSurveyData.Reset();
+            SurveyMode.Reset();
+            _initialized = false;
+        }
+
+        public static void ForceCleanup()
+        {
+            ProgressOverlay.DestroyInstance();
+            _initialized = false;
+        }
+    }
+}
