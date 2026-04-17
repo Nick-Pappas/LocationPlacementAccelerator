@@ -23,24 +23,36 @@ There are two kinds of performance gain. Speed and success rate.
 In a heavily modded setup (details later) :
  Total Requested:  17,391 location tokens, same seed (aabbxx)
  
-*Vanilla (deterministic)*
+### *Vanilla (deterministic)*
+
   Total Time:       **27m 39.7s**
+  
   Total Placed:     16,849  (96.88%)
+  
   Total Failed:     **542**
   
-*Survey single threaded (deterministic)*
+### *Survey single threaded (deterministic)*
+
   Total Time:       **3m 45.0s**
+  
   Total Placed:     16,935  (97.38%)
+  
   Total Failed:     **456**
 
-*Survey multi threaded (NON deterministic)*
+### *Survey multi threaded (NON deterministic)*
+
   Total Time:       **0m 36.6s**
+  
   Total Placed:     16,986  (97.67%)
+  
   Total Failed:     **405**
+  
+---------------------
+The trend is:
 
-**27m 39.7s** --> **3m 45.0s** --> **0m 36.6s**
-
-**542** --> **456** --> **405**
+**27m 39.7s** --> **3m 45.0s** --> **0m 36.6s**   (faster)
+ 
+**542** --> **456** --> **405** (less failures)
 
 **The Diagnostic Logger :** 
 You can run LPA purely as a diagnostic tool in any mode. For example you could leave it in Vanilla, which would leave the vanilla placement logic intact but inject telemetry, outputting an exhaustive log of exactly what happened, and precisely *why* (Altitude, Distance, Biome, etc.) failed locations were rejected.
