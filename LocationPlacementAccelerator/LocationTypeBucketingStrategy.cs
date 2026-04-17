@@ -1,4 +1,4 @@
-// v1
+// v1.0.1c
 /**
 * LT (Location Type) bucketing strategy!
 * I wrote this second, after my original biome bucketing strategy to compare experimentally.
@@ -196,7 +196,11 @@ namespace LPA
                 }
             }
 
-            bool coastalOnly = (searchBiome & WorldSurveyData.OceanFlags) != 0
+            // BiomeBoilingOcean is underwater AshLands, not an adjacent separate biome.
+            // Including it in OceanFlags would cause AshLands+BoilingOcean searches
+            // to trigger coastal-only mode, which then filters out all AshLands land
+            // zones because coastal tagging only fires on vanilla Ocean adjacency.
+            bool coastalOnly = (searchBiome & (int)Heightmap.Biome.Ocean) != 0
                             && (searchBiome & WorldSurveyData.LandBiomeMask) != 0;
 
             float minD = locationP.m_minDistance;
@@ -217,7 +221,7 @@ namespace LPA
                     continue;
                 }
 
-                if (coastalOnly && ((zone.AreaMask & (int)Heightmap.BiomeArea.Edge) == 0 || (zone.BiomeMask & WorldSurveyData.CoastalBit) == 0)) //a zone cannot be coastal if it was Median
+                if (coastalOnly && (zone.BiomeMask & WorldSurveyData.CoastalBit) == 0)
                 {
                     continue;
                 }
