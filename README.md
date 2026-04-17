@@ -1,7 +1,8 @@
-
 # Location Placement Accelerator (LPA)
 
+  NOT COMPATIBLE with warp's mod World Gen Accelerator. Use one or the other!
   
+  For a separate readme describing the config options check the github.
 
 LPA is a complete overhaul of Valheim's location placement engine, originally built to solve the massive generation times and broken unplayable worlds caused by using mods like **Better Continents** and **Expand World Size** combined with mods that add locations. Better Continents (BC hereafter) can generate incredible geology and topology and Expand World Size (EWS) can generate vast worlds, but often you cannot play in those worlds because vital locations fail to be placed during generation, and it takes forever to generate those worlds too.
   
@@ -11,7 +12,7 @@ When you use custom terrain noise, massive map radii, and hundreds of modded poi
 
 LPA can fix this by giving the placement algorithm "eyes" (pre-scanning the world topology) and optionally (although on by default) utilizing all your CPU cores. 
 
-**Note: LPA is only needed during world generation. Once your map is generated, the mod can be safely disabled or removed from your server/game. You do not need it unless you want to speed up the generation of another world.**
+### **Note: LPA is only needed during world generation. Once your map is generated, the mod can be safely disabled or removed from your server/game. You do not need it unless you want to speed up the generation of another world.**
 
 Although the original intention was for this to be a BC feature, I realized that it can help people who do not want to use BC.
 
@@ -23,23 +24,36 @@ There are two kinds of performance gain. Speed and success rate.
 In a heavily modded setup (details later) :
  Total Requested:  17,391 location tokens, same seed (aabbxx)
  
-*Vanilla (deterministic)*
+### *Vanilla (deterministic)*
+
   Total Time:       **27m 39.7s**
+  
   Total Placed:     16,849  (96.88%)
+  
   Total Failed:     **542**
   
-*Survey single threaded (deterministic)*
+### *Survey single threaded (deterministic)*
+
   Total Time:       **3m 45.0s**
+  
   Total Placed:     16,935  (97.38%)
+  
   Total Failed:     **456**
 
-*Survey multi threaded (NON deterministic)*
-  Total Time:       **0m 36.6s**
-  Total Placed:     16,986  (97.67%)
-  Total Failed:     **405**
+### *Survey multi threaded (NON deterministic)*
 
-**27m 39.7s** --> **3m 45.0s** --> **0m 36.6s**
-**542** --> **456** --> **405**
+  Total Time:       **0m 36.6s**
+  
+  Total Placed:     16,986  (97.67%)
+  
+  Total Failed:     **405**
+  
+---------------------
+The trend is:
+
+**27m 39.7s** --> **3m 45.0s** --> **0m 36.6s**   (faster)
+ 
+**542** --> **456** --> **405** (less failures)
 
 **The Diagnostic Logger :** 
 You can run LPA purely as a diagnostic tool in any mode. For example you could leave it in Vanilla, which would leave the vanilla placement logic intact but inject telemetry, outputting an exhaustive log of exactly what happened, and precisely *why* (Altitude, Distance, Biome, etc.) failed locations were rejected.
@@ -87,18 +101,20 @@ Fully compatible. In fact I was writing this to add it as functionality to Bette
 
 And also using Better Continents and Expand World Size, setting the radius to 17500.
 
-* *Vanilla Engine:* 
+**Vanilla Engine:**
+
+```
 =================================================
 ===      WORLD GENERATION SUMMARY             ===
 =================================================
 
-      Total Time:       **27m 39.7s**
+      Total Time:       27m 39.7s
       Total Requested:  17,391
-      Total Placed:     16,849  (**96.88%**)
-      Total Failed:     **542**
+      Total Placed:     16,849  (96.88%)
+      Total Failed:     542
            ----------------
             Complete failures:
-            **-Hildir_cave : 0/3** *<--this makes the world unplayable*
+            -Hildir_cave : 0/3   <-- this makes the world unplayable
             -MWL_MeadowsWall1 : 0/10
             -MWL_SwampCourtyard1 : 0/5
             -MWL_SwampBrokenTower1 : 0/15
@@ -142,19 +158,22 @@ And also using Better Continents and Expand World Size, setting the radius to 17
             -MWL_Belmont1 : 4/5
             -MWL_StoneCircle1 : 7/10
             -MWL_SwampTemple1 : 1/10
-      **Playability:      UNPLAYABLE**
-    =================================================
 
+      Playability:      UNPLAYABLE
+=================================================
+```
 
-* *LPA Survey Mode (Single-Threaded):* 
+**LPA Survey Mode (Single-Threaded):**
+
+```
 =================================================
 ===      WORLD GENERATION SUMMARY             ===
 =================================================
 
-      Total Time:       **3m 45.0s**
+      Total Time:       3m 45.0s
       Total Requested:  17,391
-      Total Placed:     16,935  (**97.38%**)
-      Total Failed:     **456**
+      Total Placed:     16,935  (97.38%)
+      Total Failed:     456
            ----------------
             Complete failures:
             -MWL_Ruins1 : 0/5
@@ -193,23 +212,25 @@ And also using Better Continents and Expand World Size, setting the radius to 17
             -MWL_ForestTower5 : 8/15
             -MWL_SwampBrokenTower3 : 1/10
             -MWL_StoneCircle1 : 9/10
-      **Playability:      Playable**
-    **-------------------------------------------------**
+
+      Playability:      Playable
+      -------------------------------------------------
       Relaxations Applied:
-     **- Hildir_cave (Relaxed 1x: MinAlt: 200->190)**
-    **=================================================**
+      - Hildir_cave (Relaxed 1x: MinAlt: 200->190)
+=================================================
+```
 
+**LPA Survey Mode (Multithreaded):**
 
-* *LPA Survey Mode (Multithreaded):* 
+```
 =================================================
 ===      WORLD GENERATION SUMMARY             ===
 =================================================
- 
 
-     Total Time:       **0m 36.6s**
+      Total Time:       0m 36.6s
       Total Requested:  17,391
-      Total Placed:     16,986  (**97.67%**)
-      Total Failed:     **405**
+      Total Placed:     16,986  (97.67%)
+      Total Failed:     405
            ----------------
             Complete failures:
             -MWL_Ruins1 : 0/5
@@ -243,83 +264,84 @@ And also using Better Continents and Expand World Size, setting the radius to 17
             -MWL_Belmont1 : 2/5
             -MWL_SwampBrokenTower1 : 4/15
             -MWL_SwampBrokenTower3 : 4/10
+
       Playability:      Playable
-    **-------------------------------------------------**
+      -------------------------------------------------
       Relaxations Applied:
-    **- Hildir_cave (Relaxed 1x: MinAlt: 200->190)**
-    **=================================================**
-
-
-
+      - Hildir_cave (Relaxed 1x: MinAlt: 200->190)
+=================================================
+```
 
 What you would see in the log if you have logging on:
 
-    [Warning][21:12:52.778] [FAILURE] Hildir_cave: 0/3. Cost: 4,113/200,000 outer loop budget and 82,260 inner loop iterations.
-    (World Altitude Profile: Min -68.0m, Max 199.6m)
-    ────────────────────────────────────────────────────────
-    PHASE 1 (Zone Search): 4,113 Checks
-    [!] Valid Zones: 4,113
-        └─ Median
-    
-    PHASE 2 (Placement): 82,260 Points Sampled in the 4,113 Median zones
-    1. DISTANCE FILTER (Min: 1750, Max: 14000)
-    [x] Failed: 7
+```
+[Warning][21:12:52.778] [FAILURE] Hildir_cave: 0/3. Cost: 4,113/200,000 outer loop budget and 82,260 inner loop iterations.
+(World Altitude Profile: Min -68.0m, Max 199.6m)
+────────────────────────────────────────────────────────
+PHASE 1 (Zone Search): 4,113 Checks
+[!] Valid Zones: 4,113
+    └─ Median
+
+PHASE 2 (Placement): 82,260 Points Sampled in the 4,113 Median zones
+1. DISTANCE FILTER (Min: 1750, Max: 14000)
+[x] Failed: 7
     Above Max: 7
-    [!] Passed: 82,253
-        └─ Range 1750-14000
-           |
-           └─ 2. BIOME MATCH (Required: Mountain): 82,253 points checked
-              [x] Failed: 35
-                  └─ BlackForest: 15
-                  └─ Plains: 10
-                  └─ Meadows: 7
-                  └─ Mistlands: 3
-              [!] Passed: 82,218
-                  └─ Mountain
-                  |
-                  └─ 3. ALTITUDE CHECK (Min: 200, Max: 5000): 82,218 points checked
-                     [x] Failed: 82,218
-                         └─ Too Low: 82,218
-                            └─ Mountain:
-                               ├─ Underwater (<0m): 12 [Observed: Min -3.0m, Avg -1.8m, Max 0.0m]
-                               ├─ Anomalous (0m to 50m): 109 [Observed: Min 0.0m, Avg 24.0m, Max 49.2m]
-                               └─ Standard Failures: 82,097 [Observed: Min 52.5m, Avg 99.2m, Max 199.6m]
+[!] Passed: 82,253
+    └─ Range 1750-14000
+       |
+       └─ 2. BIOME MATCH (Required: Mountain): 82,253 points checked
+          [x] Failed: 35
+              └─ BlackForest: 15
+              └─ Plains: 10
+              └─ Meadows: 7
+              └─ Mistlands: 3
+          [!] Passed: 82,218
+              └─ Mountain
+              |
+              └─ 3. ALTITUDE CHECK (Min: 200, Max: 5000): 82,218 points checked
+                 [x] Failed: 82,218
+                     └─ Too Low: 82,218
+                        └─ Mountain:
+                           ├─ Underwater (<0m): 12 [Observed: Min -3.0m, Avg -1.8m, Max 0.0m]
+                           ├─ Anomalous (0m to 50m): 109 [Observed: Min 0.0m, Avg 24.0m, Max 49.2m]
+                           └─ Standard Failures: 82,097 [Observed: Min 52.5m, Avg 99.2m, Max 199.6m]
+```
 
-
-  
 So in that specific instance because of the specific settings the max altitude on the map was not 200, (which is what Hildir needed) and thus all 82,218 attempts failed. However, by relaxing the requirements the world is saved:
 
-    [Info][21:14:58.763] [LPA] Relaxation pass 1: processing 1 relaxed packet(s).
-    [Message][21:14:59.385] [RELAXATION SUCCESS] Hildir_cave placed 1/1 after 1 relaxation(s). (Relaxed 1x: MinAlt: 200->190)
-    [Message][21:14:59.386] [RELAXED] Hildir_cave: 1/1. Cost: 763/200,000 outer loop budget and 15,243 inner loop iterations.
-               (Relaxed 1x: MinAlt: 200->190)
-    (World Altitude Profile: Min -68.0m, Max 199.6m)
-    ────────────────────────────────────────────────────────
-    PHASE 1 (Zone Search): 763 Checks
-    [!] Valid Zones: 763
-        └─ Median
-    
-    PHASE 2 (Placement): 15,243 Points Sampled in the 763 Median zones
-    1. DISTANCE FILTER (Min: 1750, Max: 14000)
-    [!] Passed: 15,243
-        └─ Range 1750-14000
-           |
-           └─ 2. BIOME MATCH (Required: Mountain): 15,243 points checked
-              [x] Failed: 7
-                  └─ Meadows: 5
-                  └─ Plains: 2
-              [!] Passed: 15,236
-                  └─ Mountain
-                  |
-                  └─ 3. ALTITUDE CHECK (Min: 190, Max: 5250): 15,236 points checked
-                     [x] Failed: 15,235
-                         └─ Too Low: 15,235
-                            └─ Mountain:
-                               ├─ Anomalous (0m to 50m): 57 [Observed: Min 0.9m, Avg 29.7m, Max 49.3m]
-                               └─ Standard Failures: 15,178 [Observed: Min 50.3m, Avg 95.2m, Max 182.2m]
-                     [!] Passed: 1
-                         └─ Alt 190 to 5250
-                         └─ PASSED REMAINING CHECKS (SIMILARITY -> TERRAIN DELTA -> VEGETATION DENSITY): 1
+```
+[Info][21:14:58.763] [LPA] Relaxation pass 1: processing 1 relaxed packet(s).
+[Message][21:14:59.385] [RELAXATION SUCCESS] Hildir_cave placed 1/1 after 1 relaxation(s). (Relaxed 1x: MinAlt: 200->190)
+[Message][21:14:59.386] [RELAXED] Hildir_cave: 1/1. Cost: 763/200,000 outer loop budget and 15,243 inner loop iterations.
+           (Relaxed 1x: MinAlt: 200->190)
+(World Altitude Profile: Min -68.0m, Max 199.6m)
+────────────────────────────────────────────────────────
+PHASE 1 (Zone Search): 763 Checks
+[!] Valid Zones: 763
+    └─ Median
+
+PHASE 2 (Placement): 15,243 Points Sampled in the 763 Median zones
+1. DISTANCE FILTER (Min: 1750, Max: 14000)
+[!] Passed: 15,243
+    └─ Range 1750-14000
+       |
+       └─ 2. BIOME MATCH (Required: Mountain): 15,243 points checked
+          [x] Failed: 7
+              └─ Meadows: 5
+              └─ Plains: 2
+          [!] Passed: 15,236
+              └─ Mountain
+              |
+              └─ 3. ALTITUDE CHECK (Min: 190, Max: 5250): 15,236 points checked
+                 [x] Failed: 15,235
+                     └─ Too Low: 15,235
+                        └─ Mountain:
+                           ├─ Anomalous (0m to 50m): 57 [Observed: Min 0.9m, Avg 29.7m, Max 49.3m]
+                           └─ Standard Failures: 15,178 [Observed: Min 50.3m, Avg 95.2m, Max 182.2m]
+                 [!] Passed: 1
+                     └─ Alt 190 to 5250
+                     └─ PASSED REMAINING CHECKS (SIMILARITY -> TERRAIN DELTA -> VEGETATION DENSITY): 1
+```
 
 Since it was detected than altitude was the problem the altitude was relaxed by 5% (so 200 became 190) and we looked again, successfully placing the location.
   
@@ -336,4 +358,4 @@ Since it was detected than altitude was the problem the altitude was relaxed by 
 
 4. (Optional) Disable or remove the mod. You only need it when creating a new world or forcing new location generation. It simply does not do anything otherwise.
 
-
+You can find me on Discord at the Valheim World Editing server: https://discord.gg/uqY4V8Aw 

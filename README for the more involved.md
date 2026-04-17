@@ -167,3 +167,6 @@ Anyway, the point here is, that
 $$\||\mathbf{v}\||_2 = \sqrt{x^2 + y^2 + z^2}$$
 is a bit expensive and perhaps they could be doing instead:
 $minDistance^2 < mag^2 < maxDistance^2$
+
+
+(to be continued)
