@@ -249,10 +249,10 @@ And also using Better Continents and Expand World Size, setting the radius to 17
                 -MWL_SwampBrokenTower1 : 4/15
                 -MWL_SwampBrokenTower3 : 4/10
           Playability:      Playable
-        **-------------------------------------------------**
+        -------------------------------------------------
           Relaxations Applied:
-        **- Hildir_cave (Relaxed 1x: MinAlt: 200->190)**
-    **=================================================**
+        - Hildir_cave (Relaxed 1x: MinAlt: 200->190)
+   =================================================
 
 
 
@@ -342,3 +342,4 @@ Since it was detected than altitude was the problem the altitude was relaxed by 
 4. (Optional) Disable or remove the mod. You only need it when creating a new world or forcing new location generation. It simply does not do anything otherwise.
 
 
+You can find me on Discord at the Valheim World Editing server: https://discord.gg/uqY4V8Aw 
