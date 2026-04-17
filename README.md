@@ -1,7 +1,7 @@
 
 # Location Placement Accelerator (LPA)
 
-  
+NOT COMPATIBLE with warp's mod World Gen Accelerator. Use one or the other! 
 
 LPA is a complete overhaul of Valheim's location placement engine, originally built to solve the massive generation times and broken unplayable worlds caused by using mods like **Better Continents** and **Expand World Size** combined with mods that add locations. Better Continents (BC hereafter) can generate incredible geology and topology and Expand World Size (EWS) can generate vast worlds, but often you cannot play in those worlds because vital locations fail to be placed during generation, and it takes forever to generate those worlds too.
   
@@ -337,3 +337,4 @@ Since it was detected than altitude was the problem the altitude was relaxed by 
 4. (Optional) Disable or remove the mod. You only need it when creating a new world or forcing new location generation. It simply does not do anything otherwise.
 
 
+You can find me on Valheim World Editing Server. https://discord.gg/uqY4V8Aw
