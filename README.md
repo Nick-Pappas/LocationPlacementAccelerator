@@ -1,7 +1,7 @@
 
 # Location Placement Accelerator (LPA)
 
-NOT COMPATIBLE with warp's mod World Gen Accelerator. Use one or the other! 
+  NOT COMPATIBLE with warp's mod World Gen Accelerator. Use one or the other! 
 
 LPA is a complete overhaul of Valheim's location placement engine, originally built to solve the massive generation times and broken unplayable worlds caused by using mods like **Better Continents** and **Expand World Size** combined with mods that add locations. Better Continents (BC hereafter) can generate incredible geology and topology and Expand World Size (EWS) can generate vast worlds, but often you cannot play in those worlds because vital locations fail to be placed during generation, and it takes forever to generate those worlds too.
   
@@ -39,6 +39,7 @@ In a heavily modded setup (details later) :
   Total Failed:     **405**
 
 **27m 39.7s** --> **3m 45.0s** --> **0m 36.6s**
+
 **542** --> **456** --> **405**
 
 **The Diagnostic Logger :** 
@@ -143,7 +144,8 @@ And also using Better Continents and Expand World Size, setting the radius to 17
             -MWL_StoneCircle1 : 7/10
             -MWL_SwampTemple1 : 1/10
       **Playability:      UNPLAYABLE**
-    =================================================
+
+=================================================
 
 
 * *LPA Survey Mode (Single-Threaded):* 
@@ -151,7 +153,9 @@ And also using Better Continents and Expand World Size, setting the radius to 17
 ===      WORLD GENERATION SUMMARY             ===
 =================================================
 
-      Total Time:       **3m 45.0s**
+ 
+
+     Total Time:       **3m 45.0s**
       Total Requested:  17,391
       Total Placed:     16,935  (**97.38%**)
       Total Failed:     **456**
@@ -197,56 +201,57 @@ And also using Better Continents and Expand World Size, setting the radius to 17
     **-------------------------------------------------**
       Relaxations Applied:
      **- Hildir_cave (Relaxed 1x: MinAlt: 200->190)**
-    **=================================================**
+
+**=================================================**
 
 
 * *LPA Survey Mode (Multithreaded):* 
 =================================================
 ===      WORLD GENERATION SUMMARY             ===
 =================================================
- 
+   
 
-     Total Time:       **0m 36.6s**
-      Total Requested:  17,391
-      Total Placed:     16,986  (**97.67%**)
-      Total Failed:     **405**
-           ----------------
-            Complete failures:
-            -MWL_Ruins1 : 0/5
-            -MWL_RuinsCastle1 : 0/15
-           ----------------
-            Partial failures:
-            -Grave1 : 87/200
-            -SwampHut2 : 43/50
-            -StoneTowerRuins04 : 9/50
-            -StoneTowerRuins05 : 48/50
-            -ShipWreck01 : 3/25
-            -ShipWreck02 : 6/25
-            -Vegvisir_location_Vrykolathas_TW : 10/12
-            -DeepNorth_SurtrCamp_TW : 8/25
-            -Hildir_cave : 1/3
-            -MWL_Ruins2 : 1/10
-            -MWL_Ruins3 : 9/25
-            -MWL_Ruins7 : 1/2
-            -MWL_RuinsArena1 : 6/25
-            -MWL_RuinsArena3 : 10/25
-            -MWL_RuinsChurch1 : 14/25
-            -MWL_MeadowsHouse2 : 11/20
-            -MWL_MeadowsFarm1 : 3/10
-            -MWL_MeadowsLighthouse1 : 1/10
-            -MWL_MeadowsSawmill1 : 3/10
-            -MWL_MeadowsWall1 : 8/10
-            -MWL_RuinsTower3 : 13/15
-            -MWL_ForestTower2 : 10/20
-            -MWL_MassGrave1 : 14/15
-            -MWL_SwampGrave1 : 3/25
-            -MWL_Belmont1 : 2/5
-            -MWL_SwampBrokenTower1 : 4/15
-            -MWL_SwampBrokenTower3 : 4/10
-      Playability:      Playable
-    **-------------------------------------------------**
-      Relaxations Applied:
-    **- Hildir_cave (Relaxed 1x: MinAlt: 200->190)**
+       Total Time:       **0m 36.6s**
+          Total Requested:  17,391
+          Total Placed:     16,986  (**97.67%**)
+          Total Failed:     **405**
+               ----------------
+                Complete failures:
+                -MWL_Ruins1 : 0/5
+                -MWL_RuinsCastle1 : 0/15
+               ----------------
+                Partial failures:
+                -Grave1 : 87/200
+                -SwampHut2 : 43/50
+                -StoneTowerRuins04 : 9/50
+                -StoneTowerRuins05 : 48/50
+                -ShipWreck01 : 3/25
+                -ShipWreck02 : 6/25
+                -Vegvisir_location_Vrykolathas_TW : 10/12
+                -DeepNorth_SurtrCamp_TW : 8/25
+                -Hildir_cave : 1/3
+                -MWL_Ruins2 : 1/10
+                -MWL_Ruins3 : 9/25
+                -MWL_Ruins7 : 1/2
+                -MWL_RuinsArena1 : 6/25
+                -MWL_RuinsArena3 : 10/25
+                -MWL_RuinsChurch1 : 14/25
+                -MWL_MeadowsHouse2 : 11/20
+                -MWL_MeadowsFarm1 : 3/10
+                -MWL_MeadowsLighthouse1 : 1/10
+                -MWL_MeadowsSawmill1 : 3/10
+                -MWL_MeadowsWall1 : 8/10
+                -MWL_RuinsTower3 : 13/15
+                -MWL_ForestTower2 : 10/20
+                -MWL_MassGrave1 : 14/15
+                -MWL_SwampGrave1 : 3/25
+                -MWL_Belmont1 : 2/5
+                -MWL_SwampBrokenTower1 : 4/15
+                -MWL_SwampBrokenTower3 : 4/10
+          Playability:      Playable
+        **-------------------------------------------------**
+          Relaxations Applied:
+        **- Hildir_cave (Relaxed 1x: MinAlt: 200->190)**
     **=================================================**
 
 
@@ -337,4 +342,3 @@ Since it was detected than altitude was the problem the altitude was relaxed by 
 4. (Optional) Disable or remove the mod. You only need it when creating a new world or forcing new location generation. It simply does not do anything otherwise.
 
 
-You can find me on Valheim World Editing Server. https://discord.gg/uqY4V8Aw
