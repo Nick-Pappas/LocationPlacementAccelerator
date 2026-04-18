@@ -21,11 +21,7 @@
 * 1.0.2: Sign-extension bug fix in GetBiomeMask. EWD's custom biome values can
 * set bit 31 (e.g. 0x80000000 from NextBiome wraparound). Casting (long)(int)Biome
 * on such a value sign-extends and corrupts bits 32..63 in the resulting long,
-* colliding with our synthetic flags AND aliasing all bit-31 biomes onto the same
-* mask shape. Fixed by casting through (uint) first to force zero extension.
-* Symptom in the wild: 7 custom biomes all reported with identical zone counts
-* in the survey summary, and the resulting candidate-zone selection produced
-* a visually-broken minimap with biomes painted in the wrong regions.
+* colliding with the synthetic flags.
 */
 #nullable disable
 using System;
@@ -46,7 +42,7 @@ namespace LPA
         public const long BiomeBoilingOcean = 1L << 40;
         public const long CoastalBit = 1L << 41;
 
-        // Real biome bits occupy 0..31. Ocean is bit 8 (0x100).
+        // Real biome bits occupy 0..31. Ocean is bit 8 (0x100). Why are we restricting the biomes so much though. Anyway.
         private const long AllBiomeBits = 0xFFFFFFFFL;
         public const long OceanFlags = (long)Heightmap.Biome.Ocean | BiomeBoilingOcean;
         public const long LandBiomeMask = AllBiomeBits & ~OceanFlags;

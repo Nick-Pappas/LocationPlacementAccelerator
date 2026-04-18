@@ -1,4 +1,4 @@
-// v1.0.2g
+// v1.0.2
 /**
 * Detects and talks to companion mods (Better Continents, Expand World Size, Expand World Data).
 * Pulls in the world radius from whichever size-authority mod is present (EWS only as of 1.0.1).
@@ -6,8 +6,8 @@
 * 
 * EWD integration in 1.0.1:
 *  - Detection now looks at the actual field names on ExpandWorldData.WorldInfo
-*    (Radius / TotalRadius / Stretch / BiomeStretch), which was the long-standing bug:
-*    previously we probed for a "WorldRadius" member that does not exist.
+*    (Radius / TotalRadius / Stretch / BiomeStretch), which was the long-standing bug that I kept putting off for 2 weeks... 
+*    previously I was probing for a "WorldRadius" member that does not exist.
 *  - Detection is diagnostic only. EWS is the sole size authority per project policy.
 *  - GetHighReliefBiomeMask reflects into ExpandWorldData.BiomeManager's BiomeToTerrain
 *    dictionary so custom biomes whose terrain algorithm is Mountain or Mistlands

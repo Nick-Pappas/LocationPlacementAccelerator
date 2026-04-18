@@ -4,7 +4,7 @@
 *
 * 1.0.1: searchBiome in DrainWorkUnit widened to long to match the widened
 * ZoneProfile.BiomeMask so custom EWD biomes beyond bit 15 participate correctly.
-* 1.0.2: Sign-extension fix on the (long) cast. See WorldSurveyData notes.
+* 1.0.2: Sign-extension fix on the (long) cast. See my WorldSurveyData notes.
 *
 * Architecture overview:
 *   1. BuildSpatialStreams groups location types by GTS (similarity group),
