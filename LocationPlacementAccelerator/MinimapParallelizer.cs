@@ -1,4 +1,4 @@
-// v1
+// v1.0.2 
 /**
 * Replaces vanilla's single-threaded Minimap.GenerateWorldMap() with a
 * parallel implementation. Intercepts the Minimap.Update() loop via a
@@ -176,6 +176,12 @@ namespace LPA
 
             Dictionary<Heightmap.Biome, Color32> biomeColorMap = BuildBiomeColorMap(instanceP);
 
+            Dictionary<Heightmap.Biome, Heightmap.Biome> terrainMap = null;
+            if (Compatibility.IsExpandWorldDataActive)
+            {
+                terrainMap = Compatibility.GetEwdBiomeToTerrainMap();
+            }
+
             _rowsDone = 0;
             _totalRows = texSize;
             _stopwatch = Stopwatch.StartNew();
@@ -205,10 +211,22 @@ namespace LPA
                             mapColor = c;
                         }
                         _mapColors[idx] = mapColor;
-                        _maskColors[idx] = ComputeMaskColor(wx, wy, biomeHeight, biome);
+
+                        Heightmap.Biome terrainBiome = biome;
+                        if (terrainMap != null)
+                        {
+                            bool hasTerrain = terrainMap.TryGetValue(biome, out Heightmap.Biome tb);
+                            if (hasTerrain)
+                            {
+                                terrainBiome = tb;
+                            }
+                        }
+
+                        _maskColors[idx] = ComputeMaskColor(wx, wy, biomeHeight, terrainBiome);
                         _heights[idx].r = biomeHeight;
 
-                        int packed = Mathf.Clamp((int)(biomeHeight * 127.5f), 0, 65025);
+                        float clampedHeight = Mathf.Clamp(biomeHeight, 0f, 1000f);
+                        int packed = (int)(clampedHeight * 65.535f);
                         _heightPacked[idx] = new Color32((byte)(packed >> 8), (byte)(packed & 255), 0, 255);
                     }
                     Interlocked.Increment(ref _rowsDone);
@@ -250,6 +268,20 @@ namespace LPA
             map[Heightmap.Biome.DeepNorth] = instanceP.m_deepnorthColor;
             map[Heightmap.Biome.Ocean] = (Color32)Color.white;
             map[Heightmap.Biome.Mistlands] = _mistlandsColor(instanceP);
+
+            if (Compatibility.IsExpandWorldDataActive)
+            {
+                Dictionary<Heightmap.Biome, Heightmap.Biome> terrainMap = Compatibility.GetEwdBiomeToTerrainMap();
+                if (terrainMap != null)
+                {
+                    foreach (KeyValuePair<Heightmap.Biome, Heightmap.Biome> kvp in terrainMap)
+                    {
+                        Color pixelColor = instanceP.GetPixelColor(kvp.Key);
+                        map[kvp.Key] = (Color32)pixelColor;
+                    }
+                }
+            }
+
             return map;
         }
 
@@ -270,7 +302,7 @@ namespace LPA
                 return new Color32(0, 0, (byte)(ashlandsOcean * 255f), 0);
             }
 
-            
+
             float redChannel = 0f;
             float greenChannel = 0f;
             float blueChannel = 0f;

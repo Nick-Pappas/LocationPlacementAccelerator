@@ -1,4 +1,4 @@
-// v1.0.1
+// v1.0.2g
 /**
 * Detects and talks to companion mods (Better Continents, Expand World Size, Expand World Data).
 * Pulls in the world radius from whichever size-authority mod is present (EWS only as of 1.0.1).
@@ -19,6 +19,7 @@ using BepInEx.Logging;
 using HarmonyLib;
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Reflection;
 
 namespace LPA
@@ -34,7 +35,7 @@ namespace LPA
 
         /**
         * Written by the BC MinimapGenerationComplete event handler
-        * (in Nick's BC fork; needs to be pushed to Jere's upstream).
+        * (in my BC fork; needs to be pushed to Jere's upstream).
         * The placement coroutine waits on this before starting workers.
         * Volatile for cross-frame visibility even though both reads and writes
         * currently happen on the main thread.
@@ -109,6 +110,44 @@ namespace LPA
             WorldRadiusSource = source;
 
             return radius;
+        }
+
+        /**
+        * Retrieves the full dictionary mapping custom biomes to their underlying terrain biome.
+        * Used by the minimap parallelizer to resolve colors and mask overlays correctly for EWD.
+        */
+        public static Dictionary<Heightmap.Biome, Heightmap.Biome> GetEwdBiomeToTerrainMap()
+        {
+            if (!IsExpandWorldDataActive || _ewdBiomeToTerrainField == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                object dictObj = _ewdBiomeToTerrainField.GetValue(null);
+                if (dictObj is IDictionary dict)
+                {
+                    Dictionary<Heightmap.Biome, Heightmap.Biome> map = new Dictionary<Heightmap.Biome, Heightmap.Biome>();
+                    foreach (DictionaryEntry entry in dict)
+                    {
+                        if (entry.Key == null || entry.Value == null)
+                        {
+                            continue;
+                        }
+                        map[(Heightmap.Biome)entry.Key] = (Heightmap.Biome)entry.Value;
+                    }
+                    return map;
+                }
+            }
+            catch (Exception exP)
+            {
+                DiagnosticLog.WriteTimestampedLog(
+                    $"[LPACompatibility] Failed to extract EWD BiomeToTerrain map: {exP.Message}",
+                    BepInEx.Logging.LogLevel.Warning);
+            }
+
+            return null;
         }
 
         /**
