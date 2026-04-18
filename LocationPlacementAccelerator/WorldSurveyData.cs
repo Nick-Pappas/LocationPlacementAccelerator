@@ -1,4 +1,4 @@
-// v1
+// v1.0.2
 /**
 * Pre-scans the entire world grid in parallel, building a flat ZoneProfile[]
 * array with packed biome/area/distance bitmasks per zone. Also performs
@@ -9,10 +9,29 @@
 * ZoneToIndex maps Vector2i --> flat array index.
 * OccupiedZoneIndices tracks zones that already have a location placed.
 * Here is where the magic happens. 
+*
+* 1.0.1: Biome masks widened to long. EWD custom biomes can occupy bits 0..31 in
+* the Heightmap.Biome enum. LPA's synthetic flags (BiomeBoilingOcean, CoastalBit)
+* moved to bits 40/41 so they can never collide with a legitimate biome value.
+* LandBiomeMask now covers all 32 biome bits minus ocean flags. Biome distribution
+* logging uses the EWD BiomeManager (via reflection in Compatibility) for names
+* when available so custom biomes show as their user-defined names instead of
+* bare numeric values.
+*
+* 1.0.2: Sign-extension bug fix in GetBiomeMask. EWD's custom biome values can
+* set bit 31 (e.g. 0x80000000 from NextBiome wraparound). Casting (long)(int)Biome
+* on such a value sign-extends and corrupts bits 32..63 in the resulting long,
+* colliding with our synthetic flags AND aliasing all bit-31 biomes onto the same
+* mask shape. Fixed by casting through (uint) first to force zero extension.
+* Symptom in the wild: 7 custom biomes all reported with identical zone counts
+* in the survey summary, and the resulting candidate-zone selection produced
+* a visually-broken minimap with biomes painted in the wrong regions.
 */
 #nullable disable
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
@@ -21,10 +40,16 @@ namespace LPA
 {
     public static class WorldSurveyData
     {
-        public const int BiomeBoilingOcean = 1 << 16;
-        public const int CoastalBit = 1 << 17;
-        public const int OceanFlags = (int)Heightmap.Biome.Ocean | BiomeBoilingOcean;
-        public const int LandBiomeMask = ((1 << 17) - 1) & ~OceanFlags;
+        // Synthetic flags live above the biome enum range. Heightmap.Biome can
+        // produce values up to bit 31 (EWD's NextBiome doubles from 0x200 to 0x80000000
+        // then wraps to 0x80). Bits 32..63 are ours to use.
+        public const long BiomeBoilingOcean = 1L << 40;
+        public const long CoastalBit = 1L << 41;
+
+        // Real biome bits occupy 0..31. Ocean is bit 8 (0x100).
+        private const long AllBiomeBits = 0xFFFFFFFFL;
+        public const long OceanFlags = (long)Heightmap.Biome.Ocean | BiomeBoilingOcean;
+        public const long LandBiomeMask = AllBiomeBits & ~OceanFlags;
 
         public static ZoneProfile[] Grid { get; private set; }
         public static Dictionary<Vector2i, int> ZoneToIndex { get; private set; } = new Dictionary<Vector2i, int>();
@@ -116,13 +141,17 @@ namespace LPA
                         localMaxAlt[iP] = normH;
                     }
 
-                    int bMask = GetBiomeMask(center, gridSize, offsets);
+                    long bMask = GetBiomeMask(center, gridSize, offsets);
 
-                    // AshLands zones below sea level are reclassified as BiomeBoilingOcean so they match AshLands underwater location types during candidate scan.
-                    bool isAshLands = (bMask & (int)Heightmap.Biome.AshLands) != 0;
+                    // AshLands zones below sea level are reclassified as BiomeBoilingOcean so they match
+                    // AshLands underwater location types during candidate scan.
+                    // NOTE: this remains a vanilla-geometry-specific hack. A custom "lava" biome whose
+                    // terrain dips below sea level would NOT be reclassified here. Acceptable for now
+                    // because this only matters for the handful of AshLands sub-sea location types.
+                    bool isAshLands = (bMask & (long)Heightmap.Biome.AshLands) != 0L;
                     if (isAshLands && normH < -4.0f)
                     {
-                        bMask &= ~(int)Heightmap.Biome.AshLands;
+                        bMask &= ~(long)Heightmap.Biome.AshLands;
                         bMask |= BiomeBoilingOcean;
                     }
 
@@ -168,8 +197,9 @@ namespace LPA
             Grid = tempList.ToArray();
 
             // Coastal Tagging: tag any zone adjacent to an ocean/land boundary.
+            // coastMap is now long[] to carry the full biome mask per zone.
             {
-                int[] coastMap = new int[diameter * diameter];
+                long[] coastMap = new long[diameter * diameter];
                 for (int gi = 0; gi < Grid.Length; gi++)
                 {
                     ZoneProfile z = Grid[gi];
@@ -179,10 +209,9 @@ namespace LPA
                 int coastalTagged = 0;
                 for (int gi = 0; gi < Grid.Length; gi++)
                 {
-                    if ((Grid[gi].AreaMask & (int)Heightmap.BiomeArea.Edge) == 0) continue;
-                    int bm = Grid[gi].BiomeMask;
-                    bool isOcean = (bm & OceanFlags) != 0;
-                    bool isLand = (bm & LandBiomeMask) != 0;
+                    long bm = Grid[gi].BiomeMask;
+                    bool isOcean = (bm & OceanFlags) != 0L;
+                    bool isLand = (bm & LandBiomeMask) != 0L;
                     if (!isOcean && !isLand)
                     {
                         continue;
@@ -206,17 +235,17 @@ namespace LPA
                             {
                                 continue;
                             }
-                            int nb = coastMap[ny * diameter + nx];
-                            if (nb == 0)
+                            long nb = coastMap[ny * diameter + nx];
+                            if (nb == 0L)
                             {
                                 continue;
                             }
 
-                            if (isOcean && (nb & LandBiomeMask) != 0)
+                            if (isOcean && (nb & LandBiomeMask) != 0L)
                             {
                                 tagged = true;
                             }
-                            else if (isLand && (nb & (int)Heightmap.Biome.Ocean) != 0)
+                            else if (isLand && (nb & (long)Heightmap.Biome.Ocean) != 0L)
                             {
                                 tagged = true;
                             }
@@ -254,14 +283,17 @@ namespace LPA
             return offsets;
         }
 
-        private static int GetBiomeMask(Vector3 zoneCenterP, int gridSizeP, float[] offsetsP)
+        private static long GetBiomeMask(Vector3 zoneCenterP, int gridSizeP, float[] offsetsP)
         {
-            int mask = 0;
+            long mask = 0L;
             for (int ox = 0; ox < gridSizeP; ox++)
             {
                 for (int oz = 0; oz < gridSizeP; oz++)
                 {
-                    mask |= (int)WorldGenerator.instance.GetBiome(new Vector3(zoneCenterP.x + offsetsP[ox], 0, zoneCenterP.z + offsetsP[oz]));
+                    // (uint) cast first to prevent sign extension when biome bit 31 is set
+                    // (EWD's NextBiome can produce 0x80000000). (long)(int) would sign-extend
+                    // and corrupt bits 32..63 in the mask, colliding with our synthetic flags.
+                    mask |= (long)(uint)(int)WorldGenerator.instance.GetBiome(new Vector3(zoneCenterP.x + offsetsP[ox], 0, zoneCenterP.z + offsetsP[oz]));
                 }
             }
             return mask;
@@ -303,20 +335,102 @@ namespace LPA
             return mask;
         }
 
+        /**
+        * Builds a biome-value -> display-name map. When EWD is active we pull
+        * BiomeManager.BiomeToDisplayName via reflection so custom biomes log with
+        * their user-defined names ("Summit", "Deep Meadows"). When EWD is absent
+        * or reflection fails, vanilla enum names are used.
+        */
+        private static Dictionary<long, string> BuildBiomeNameMap()
+        {
+            Dictionary<long, string> map = new Dictionary<long, string>();
+
+            if (Compatibility.IsExpandWorldDataActive)
+            {
+                try
+                {
+                    Assembly ewdAssembly = null;
+                    foreach (BepInEx.PluginInfo info in BepInEx.Bootstrap.Chainloader.PluginInfos.Values)
+                    {
+                        if (info.Metadata.GUID == "expand_world_data")
+                        {
+                            ewdAssembly = info.Instance.GetType().Assembly;
+                            break;
+                        }
+                    }
+                    if (ewdAssembly != null)
+                    {
+                        Type bmType = ewdAssembly.GetType("ExpandWorldData.BiomeManager");
+                        if (bmType != null)
+                        {
+                            FieldInfo nameField = bmType.GetField("BiomeToDisplayName",
+                                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                            if (nameField != null)
+                            {
+                                object dictObj = nameField.GetValue(null);
+                                if (dictObj is IDictionary dict)
+                                {
+                                    foreach (DictionaryEntry entry in dict)
+                                    {
+                                        if (entry.Key == null)
+                                        {
+                                            continue;
+                                        }
+                                        long biomeVal = (long)(int)(Heightmap.Biome)entry.Key;
+                                        string displayName = entry.Value as string;
+                                        if (!string.IsNullOrEmpty(displayName) && !map.ContainsKey(biomeVal))
+                                        {
+                                            map[biomeVal] = displayName;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // Fall through to vanilla name map.
+                }
+            }
+
+            // Ensure vanilla names are always present as a fallback.
+            AddIfAbsent(map, (long)Heightmap.Biome.Meadows, "Meadows");
+            AddIfAbsent(map, (long)Heightmap.Biome.Swamp, "Swamp");
+            AddIfAbsent(map, (long)Heightmap.Biome.Mountain, "Mountain");
+            AddIfAbsent(map, (long)Heightmap.Biome.BlackForest, "BlackForest");
+            AddIfAbsent(map, (long)Heightmap.Biome.Plains, "Plains");
+            AddIfAbsent(map, (long)Heightmap.Biome.AshLands, "AshLands");
+            AddIfAbsent(map, (long)Heightmap.Biome.DeepNorth, "DeepNorth");
+            AddIfAbsent(map, (long)Heightmap.Biome.Ocean, "Ocean");
+            AddIfAbsent(map, (long)Heightmap.Biome.Mistlands, "Mistlands");
+
+            return map;
+        }
+
+        private static void AddIfAbsent(Dictionary<long, string> mapP, long keyP, string valueP)
+        {
+            if (!mapP.ContainsKey(keyP))
+            {
+                mapP[keyP] = valueP;
+            }
+        }
+
         private static void LogSurveySummary(long msP)
         {
             DiagnosticLog.WriteTimestampedLog($"Survey initialization completed in: {msP}ms.");
 
-            Dictionary<int, int> biomeCounts = new Dictionary<int, int>();
+            Dictionary<long, int> biomeCounts = new Dictionary<long, int>();
 
             for (int gi = 0; gi < Grid.Length; gi++)
             {
-                int bm = Grid[gi].BiomeMask;
+                long bm = Grid[gi].BiomeMask;
 
-                for (int bit = 0; bit < 17; bit++)
+                // Iterate all 32 real biome bits so EWD custom biomes are counted.
+                for (int bit = 0; bit < 32; bit++)
                 {
-                    int flag = 1 << bit;
-                    if ((bm & flag) != 0)
+                    long flag = 1L << bit;
+                    if ((bm & flag) != 0L)
                     {
                         bool hasCount = biomeCounts.TryGetValue(flag, out int count);
                         if (!hasCount)
@@ -326,7 +440,7 @@ namespace LPA
                         biomeCounts[flag] = count + 1;
                     }
                 }
-                if ((bm & BiomeBoilingOcean) != 0)
+                if ((bm & BiomeBoilingOcean) != 0L)
                 {
                     bool hasCount = biomeCounts.TryGetValue(BiomeBoilingOcean, out int count);
                     if (!hasCount)
@@ -337,24 +451,34 @@ namespace LPA
                 }
             }
 
-            DiagnosticLog.WriteLog("Biome Distribution:");
-            List<KeyValuePair<int, int>> sorted = new List<KeyValuePair<int, int>>(biomeCounts);
-            sorted.Sort((KeyValuePair<int, int> aP, KeyValuePair<int, int> bP) => bP.Value.CompareTo(aP.Value));
+            Dictionary<long, string> nameMap = BuildBiomeNameMap();
 
-            foreach (KeyValuePair<int, int> kvp in sorted)
+            DiagnosticLog.WriteLog("Biome Distribution:");
+            List<KeyValuePair<long, int>> sorted = new List<KeyValuePair<long, int>>(biomeCounts);
+            sorted.Sort((KeyValuePair<long, int> aP, KeyValuePair<long, int> bP) => bP.Value.CompareTo(aP.Value));
+
+            foreach (KeyValuePair<long, int> kvp in sorted)
             {
                 if (kvp.Value == 0)
                 {
                     continue;
                 }
-                string name = ((Heightmap.Biome)kvp.Key).ToString();
+                string name;
                 if (kvp.Key == BiomeBoilingOcean)
                 {
                     name = "AshLands (Boiling Ocean)";
                 }
-                else if (kvp.Key == (int)Heightmap.Biome.AshLands)
+                else if (kvp.Key == (long)Heightmap.Biome.AshLands)
                 {
                     name = "AshLands (Land)";
+                }
+                else
+                {
+                    bool hasName = nameMap.TryGetValue(kvp.Key, out name);
+                    if (!hasName || string.IsNullOrEmpty(name))
+                    {
+                        name = $"Biome 0x{kvp.Key:X}";
+                    }
                 }
                 DiagnosticLog.WriteLog($"   - {name,-25}: {kvp.Value,7:N0} zones");
             }

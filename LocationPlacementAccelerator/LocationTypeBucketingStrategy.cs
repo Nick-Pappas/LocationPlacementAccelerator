@@ -1,4 +1,4 @@
-// v1.0.1c
+// v1.0.2
 /**
 * LT (Location Type) bucketing strategy!
 * I wrote this second, after my original biome bucketing strategy to compare experimentally.
@@ -23,6 +23,10 @@
 * Currently biome works identically to location performance wise so it is clearly buggy.
 * Lazy should be beating eager as a matter of principle. In life too?:D
 * I need to remove the TODO comment once I fix it.
+*
+* 1.0.1: searchBiome widened to long to match the widened ZoneProfile.BiomeMask
+* so custom EWD biomes beyond bit 15 participate in candidate filtering.
+* 1.0.2: Sign-extension fix on the (long) cast. See WorldSurveyData notes.
 */
 #nullable disable
 using System;
@@ -179,11 +183,15 @@ namespace LPA
         {
             List<Vector2i> results = new List<Vector2i>();
             int requiredArea = (int)locationP.m_biomeArea;
-            int searchBiome = (int)locationP.m_biome;
+            // (uint) cast first to prevent sign extension when biome bit 31 is set.
+            long searchBiome = (long)(uint)(int)locationP.m_biome;
 
             // AshLands locations with sub-sea-level altitude ranges need to match
             // my homebrewed BiomeBoilingOcean flag set during survey.
-            bool isAshLands = (searchBiome & (int)Heightmap.Biome.AshLands) != 0;
+            // NOTE (1.0.1): literal AshLands reference retained. This is geometry-specific
+            // (below-sea reclassification of vanilla AshLands zones) not a generic lava-biome
+            // check. Flagged for a future pass to generalize across EWD custom lava biomes.
+            bool isAshLands = (searchBiome & (long)Heightmap.Biome.AshLands) != 0L;
             if (isAshLands && locationP.m_minAltitude < -4.0f)
             {
                 if (locationP.m_maxAltitude < -4.0f)
@@ -196,12 +204,8 @@ namespace LPA
                 }
             }
 
-            // BiomeBoilingOcean is underwater AshLands, not an adjacent separate biome.
-            // Including it in OceanFlags would cause AshLands+BoilingOcean searches
-            // to trigger coastal-only mode, which then filters out all AshLands land
-            // zones because coastal tagging only fires on vanilla Ocean adjacency.
-            bool coastalOnly = (searchBiome & (int)Heightmap.Biome.Ocean) != 0
-                            && (searchBiome & WorldSurveyData.LandBiomeMask) != 0;
+            bool coastalOnly = (searchBiome & WorldSurveyData.OceanFlags) != 0L
+                            && (searchBiome & WorldSurveyData.LandBiomeMask) != 0L;
 
             float minD = locationP.m_minDistance;
             float maxD = _cachedWorldRadius;
@@ -214,14 +218,14 @@ namespace LPA
             {
                 ZoneProfile zone = WorldSurveyData.Grid[i];
 
-                bool biomeMatch = (zone.BiomeMask & searchBiome) != 0;
+                bool biomeMatch = (zone.BiomeMask & searchBiome) != 0L;
                 bool areaMatch = (zone.AreaMask & requiredArea) != 0;
                 if (!biomeMatch || !areaMatch)
                 {
                     continue;
                 }
 
-                if (coastalOnly && (zone.BiomeMask & WorldSurveyData.CoastalBit) == 0)
+                if (coastalOnly && (zone.BiomeMask & WorldSurveyData.CoastalBit) == 0L)
                 {
                     continue;
                 }

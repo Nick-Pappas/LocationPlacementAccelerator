@@ -1,6 +1,10 @@
-// v1
+// v1.0.2
 /**
 * Multi-threaded placement path for the replacement engine.
+*
+* 1.0.1: searchBiome in DrainWorkUnit widened to long to match the widened
+* ZoneProfile.BiomeMask so custom EWD biomes beyond bit 15 participate correctly.
+* 1.0.2: Sign-extension fix on the (long) cast. See WorldSurveyData notes.
 *
 * Architecture overview:
 *   1. BuildSpatialStreams groups location types by GTS (similarity group),
@@ -27,8 +31,8 @@
 *   - PresenceGrid: lock-free CAS per cell (see PresenceGrid.cs).
 *   - RegisterLocation: main thread only, called in DrainAndCommit.
 *   
-*   Wanted to rename the mod from LPA to PIA.
-*   God class, with lots of god methods. Reading this a year from now will be great.
+*   Almost made me rename the mod from LPA to PIA.
+*   God class, with lots of god methods. Enjoy, me reading this a year from now.
 */
 #nullable disable
 using System;
@@ -62,7 +66,7 @@ namespace LPA
         private static ConcurrentDictionary<string, StrongBox<int>> _remainingToPlace;
 
         /**
-        * Per-prefab counter/telemetry lists, one entry per region that contains zones for the type.
+        * Per-prefab counter/telemetry lists - one entry per region that contains zones for the type.
         * Pre-allocated on main thread during BuildSpatialStreams.
         * Workers write to their own pre-assigned instances (never to the list), aggregated by one worker at flush.
         */
@@ -791,9 +795,12 @@ namespace LPA
             * Must mirror ScanWorldForCandidates' BoilingOcean augmentation:
             * candidate lists include BoilingOcean zones for AshLands types
             * whose altitude range extends below -4m, so the biome mask must match.
+            * NOTE (1.0.1): literal AshLands reference retained. This is geometry-specific
+            * (below-sea reclassification of vanilla AshLands zones) not a generic lava-biome
+            * check. Flagged for a future pass to generalize across EWD custom lava biomes.
             */
-            int searchBiome = (int)loc.m_biome;
-            bool isAshLands = (searchBiome & (int)Heightmap.Biome.AshLands) != 0;
+            long searchBiome = (long)(uint)(int)loc.m_biome;
+            bool isAshLands = (searchBiome & (long)Heightmap.Biome.AshLands) != 0L;
             if (isAshLands && loc.m_minAltitude < -4.0f)
             {
                 if (loc.m_maxAltitude < -4.0f)

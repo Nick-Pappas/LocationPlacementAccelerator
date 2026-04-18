@@ -1,4 +1,4 @@
-// v1
+// v1.0.1
 /**
 * Core of the replaced placement engine. This partial class contains:
 *  Run(): the entry-point coroutine called by ReplacedEnginePatches
@@ -15,6 +15,11 @@
 * The other two partial files are:
 *  PlacementEngine.Sequential.cs : single-threaded token loop
 *  PlacementEngine.Parallel.cs   : multi-threaded spatial partition pipeline
+*
+* 1.0.1: high-relief biome mask moved from a compile-time const to a runtime field
+* that includes EWD custom biomes whose terrain algorithm is Mountain or Mistlands
+* (Zeus's Summit, High Peak Mountain, Deep Mistlands, etc.). Populated in Run()
+* via Compatibility.GetHighReliefBiomeMask(). Vanilla fallback is Mountain|Mistlands.
 */
 #nullable disable
 using System;
@@ -39,6 +44,14 @@ namespace LPA
         private static bool _logSuccesses;
         private static PlacementMode _mode;
         private static bool _enable3DSimilarity;
+
+        /**
+        * Biomes that trigger the 3D similarity fallback. Vanilla default is
+        * Mountain | Mistlands. When EWD is active, Compatibility.GetHighReliefBiomeMask()
+        * adds any custom biome whose terrain algorithm maps to Mountain or Mistlands
+        * (Summit, High Peak Mountain, Deep Mistlands, etc.). Set once in Run().
+        */
+        private static Heightmap.Biome _highReliefBiomeMask = Heightmap.Biome.Mountain | Heightmap.Biome.Mistlands;
 
         /**
         * Group --> set of distinct minDistanceFromSimilar values.
@@ -104,6 +117,7 @@ namespace LPA
             _logSuccesses = ModConfig.LogSuccesses.Value;
             _mode = ModConfig.EffectiveMode;
             _enable3DSimilarity = ModConfig.Enable3DSimilarityCheck.Value;
+            _highReliefBiomeMask = Compatibility.GetHighReliefBiomeMask();
 
             _parallelPlacement = ModConfig.EnableParallelPlacement.Value
                 && _mode == PlacementMode.Survey;
@@ -335,11 +349,9 @@ namespace LPA
         * When the 2D bit is set AND the biome is high-relief, this method verifies with actual 3D Euclidean
         * distance against placed instances. Only fires on the rare path (bit=1 AND high-relief biome), so cost is negligible.
         */
-        private const Heightmap.Biome HighReliefBiomes = Heightmap.Biome.Mountain | Heightmap.Biome.Mistlands; //should I add Ashlands here too? The thing is I have not played the game to reach ashlands, so who knows if ashlands needs any handling here. From the little I flew around it, it looked pretty flat to me.
-
         private static bool IsHighRelief(Heightmap.Biome biomeP)
         {
-            return (biomeP & HighReliefBiomes) != 0;
+            return (biomeP & _highReliefBiomeMask) != 0;
         }
 
         private static bool Confirm3DSimilarityConflict(
