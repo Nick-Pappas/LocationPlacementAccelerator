@@ -1,4 +1,4 @@
-// v1.0.1
+// v1.0.2
 /**
 * Core of the replaced placement engine. This partial class contains:
 *  Run(): the entry-point coroutine called by ReplacedEnginePatches
@@ -20,6 +20,9 @@
 * that includes EWD custom biomes whose terrain algorithm is Mountain or Mistlands
 * (Zeus's Summit, High Peak Mountain, Deep Mistlands, etc.). Populated in Run()
 * via Compatibility.GetHighReliefBiomeMask(). Vanilla fallback is Mountain|Mistlands.
+* 
+* 1.0.2: Passed location priority into RelaxationTracker.CheckAndMarkFailed
+* to support accurate failure severity tracking (Red/Orange/Yellow).
 */
 #nullable disable
 using System;
@@ -490,7 +493,7 @@ namespace LPA
             {
                 if (!ConstraintRelaxer.TryRelax(data))
                 {
-                    RelaxationTracker.CheckAndMarkFailed(prefab, globalPlacedP, origQty);
+                    RelaxationTracker.CheckAndMarkFailed(prefab, globalPlacedP, origQty, locP.m_prioritized);
                 }
             }
 

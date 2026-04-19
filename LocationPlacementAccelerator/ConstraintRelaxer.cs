@@ -1,4 +1,5 @@
 // v1
+
 /**
 * Smart recovery system for vital location types. When a critical type
 * (boss altar, vendor, quest camp) fails to place, this analyzes the
@@ -9,6 +10,15 @@
 * configurabe but I think this would be best handled perhaps using
 * EWD yamls entries or something instead of confusing ridiculously long
 * cfg entries. So another TODO... 
+*
+* THE TODO! done?! 
+* 1.0.1: Passed prioritization context to RelaxationTracker calls so 
+* severity evaluation correctly categorizes failures as Red, Orange, or Yellow.
+*
+* 1.0.2: Fixed relaxation math to strictly respect the configured magnitude percentage.
+* Removed massive hardcoded leaps on Unknown bottlenecks. Added clamping to ensure
+* land structures (MinAlt >= 0) are never relaxed to spawn underwater, and underwater
+* structures (MaxAlt <= 0) are never relaxed to spawn on land. 
 */
 #nullable disable
 using System;
@@ -176,7 +186,7 @@ namespace LPA
             float preMaxTerr = dataP.Loc.m_maxTerrainDelta;
             float preExtRad = dataP.Loc.m_exteriorRadius;
 
-            ApplyRelaxation(dataP.Loc, bottleneck, attempts + 1, maxAttempts);
+            ApplyRelaxation(dataP.Loc, prefabName, bottleneck, attempts + 1, maxAttempts);
 
             string attemptDesc = BuildAttemptDescription(
                 bottleneck, attempts + 1,
@@ -184,7 +194,8 @@ namespace LPA
                 dataP.Loc.m_minAltitude, dataP.Loc.m_maxAltitude,
                 dataP.Loc.m_minDistance, dataP.Loc.m_maxDistance,
                 dataP.Loc.m_maxTerrainDelta, dataP.Loc.m_exteriorRadius);
-            RelaxationTracker.MarkRelaxationAttempt(prefabName, attemptDesc);
+
+            RelaxationTracker.MarkRelaxationAttempt(prefabName, attemptDesc, dataP.Loc.m_prioritized);
 
             Interleaver.SyncRelaxation(dataP.Loc);
 
@@ -249,7 +260,7 @@ namespace LPA
             return true;
         }
 
-        private static void ApplyRelaxation(ZoneLocation locP, PlacementBottleneck bottleneckP, int attemptNumberP, int maxAttemptsP)
+        private static void ApplyRelaxation(ZoneLocation locP, string prefabNameP, PlacementBottleneck bottleneckP, int attemptNumberP, int maxAttemptsP)
         {
             float mag = ModConfig.RelaxationMagnitude.Value;
 
@@ -257,44 +268,97 @@ namespace LPA
                 $"[Adjuster] RELAXING {locP.m_prefabName} (Attempt {attemptNumberP}/{maxAttemptsP}). Bottleneck: {bottleneckP}. Attempting immediate retry.",
                 BepInEx.Logging.LogLevel.Message);
 
-            switch (bottleneckP)
+            bool hasOrig = _originalStats.TryGetValue(prefabNameP, out OriginalStats orig);
+            if (!hasOrig)
             {
-                case PlacementBottleneck.Altitude:
-                    float original = locP.m_minAltitude;
-                    locP.m_minAltitude = locP.m_minAltitude - Mathf.Max(5f, Mathf.Abs(locP.m_minAltitude) * mag);
-                    DiagnosticLog.WriteLog($"   -> MinAltitude stepped down from {original:F0}m to {locP.m_minAltitude:F0}m");
-                    locP.m_maxAltitude += Mathf.Max(10f, Mathf.Abs(locP.m_maxAltitude) * mag);
-                    break;
+                orig = new OriginalStats
+                {
+                    MinAlt = locP.m_minAltitude,
+                    MaxAlt = locP.m_maxAltitude,
+                    MinDist = locP.m_minDistance,
+                    MaxDist = locP.m_maxDistance,
+                    MinTerr = locP.m_minTerrainDelta,
+                    MaxTerr = locP.m_maxTerrainDelta,
+                    ExtRad = locP.m_exteriorRadius
+                };
+            }
 
-                case PlacementBottleneck.Distance:
-                    float maxDist = ModConfig.WorldRadius;
-                    if (locP.m_maxDistance > 0.1f)
+            bool relaxAlt = (bottleneckP == PlacementBottleneck.Altitude || bottleneckP == PlacementBottleneck.Unknown);
+            bool relaxDist = (bottleneckP == PlacementBottleneck.Distance || bottleneckP == PlacementBottleneck.Unknown);
+            bool relaxTerr = (bottleneckP == PlacementBottleneck.Terrain || bottleneckP == PlacementBottleneck.Unknown);
+            bool relaxSim = (bottleneckP == PlacementBottleneck.Similarity || bottleneckP == PlacementBottleneck.Unknown);
+
+            if (relaxAlt)
+            {
+                float minAltStep = Mathf.Max(1f, Mathf.Abs(locP.m_minAltitude) * mag);
+                locP.m_minAltitude -= minAltStep;
+                if (orig.MinAlt >= 0f && locP.m_minAltitude < 0f)
+                {
+                    locP.m_minAltitude = 0f;
+                }
+
+                float maxAltStep = Mathf.Max(1f, Mathf.Abs(locP.m_maxAltitude) * mag);
+                locP.m_maxAltitude += maxAltStep;
+                if (orig.MaxAlt <= 0f && locP.m_maxAltitude > 0f)
+                {
+                    locP.m_maxAltitude = 0f;
+                }
+
+                DiagnosticLog.WriteLog($"   -> Altitude relaxed to {locP.m_minAltitude:F0}m..{locP.m_maxAltitude:F0}m");
+            }
+
+            if (relaxDist)
+            {
+                if (locP.m_maxDistance > 0.1f)
+                {
+                    float maxDistStep = Mathf.Max(1f, locP.m_maxDistance * mag);
+                    locP.m_maxDistance += maxDistStep;
+                }
+
+                if (locP.m_minDistance > 0f)
+                {
+                    float minDistStep = Mathf.Max(1f, locP.m_minDistance * mag);
+                    locP.m_minDistance -= minDistStep;
+                    if (locP.m_minDistance < 0f)
                     {
-                        maxDist = locP.m_maxDistance;
+                        locP.m_minDistance = 0f;
                     }
-                    locP.m_maxDistance = maxDist + (maxDist * mag);
-                    locP.m_minDistance = Mathf.Max(0f, locP.m_minDistance - (locP.m_minDistance * mag));
-                    break;
+                }
 
-                case PlacementBottleneck.Terrain:
-                    locP.m_maxTerrainDelta += Mathf.Max(2f, locP.m_maxTerrainDelta * mag);
-                    locP.m_minTerrainDelta = Mathf.Max(0f, locP.m_minTerrainDelta - (locP.m_minTerrainDelta * mag));
-                    break;
+                DiagnosticLog.WriteLog($"   -> Distance relaxed to {locP.m_minDistance:F0}m..{locP.m_maxDistance:F0}m");
+            }
 
-                case PlacementBottleneck.Similarity:
-                    locP.m_exteriorRadius = Mathf.Max(0f, locP.m_exteriorRadius - (locP.m_exteriorRadius * mag));
-                    break;
+            if (relaxTerr)
+            {
+                float maxTerrStep = Mathf.Max(1f, locP.m_maxTerrainDelta * mag);
+                locP.m_maxTerrainDelta += maxTerrStep;
 
-                default:
-                    locP.m_maxTerrainDelta += 5f;
-                    float defMaxDist = ModConfig.WorldRadius;
-                    if (locP.m_maxDistance > 0.1f)
+                if (locP.m_minTerrainDelta > 0f)
+                {
+                    float minTerrStep = Mathf.Max(1f, locP.m_minTerrainDelta * mag);
+                    locP.m_minTerrainDelta -= minTerrStep;
+                    if (locP.m_minTerrainDelta < 0f)
                     {
-                        defMaxDist = locP.m_maxDistance;
+                        locP.m_minTerrainDelta = 0f;
                     }
-                    locP.m_maxDistance = defMaxDist * 1.1f;
-                    locP.m_minAltitude -= 10f;
-                    break;
+                }
+
+                DiagnosticLog.WriteLog($"   -> TerrainDelta relaxed to {locP.m_minTerrainDelta:F1}..{locP.m_maxTerrainDelta:F1}");
+            }
+
+            if (relaxSim)
+            {
+                if (locP.m_exteriorRadius > 0f)
+                {
+                    float extRadStep = Mathf.Max(1f, locP.m_exteriorRadius * mag);
+                    locP.m_exteriorRadius -= extRadStep;
+                    if (locP.m_exteriorRadius < 0f)
+                    {
+                        locP.m_exteriorRadius = 0f;
+                    }
+                }
+
+                DiagnosticLog.WriteLog($"   -> ExteriorRadius relaxed to {locP.m_exteriorRadius:F0}");
             }
         }
 

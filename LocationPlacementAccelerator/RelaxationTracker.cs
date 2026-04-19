@@ -1,8 +1,12 @@
-// v1
+// v2
 /**
 * Runtime tracking of which vital location types have been relaxed, rescued,
 * or exhausted during placement. Thread-safe, workers mutate under lock,
 * GUI thread reads snapshots via GetSnapshot().
+* 
+* v2: Added severity tracking. Records FailureSeverity per prefab based on
+* priority and uniqueness policies, computing the highest active severity 
+* during snapshot generation.
 */
 #nullable disable
 using System.Collections.Generic;
@@ -20,16 +24,19 @@ namespace LPA
         private static HashSet<string> _relaxationSucceeded = new HashSet<string>();
         private static HashSet<string> _relaxationExhausted = new HashSet<string>();
         private static Dictionary<string, List<string>> _relaxationAttemptLog = new Dictionary<string, List<string>>(System.StringComparer.Ordinal);
+        private static Dictionary<string, FailureSeverity> _failureSeverities = new Dictionary<string, FailureSeverity>(System.StringComparer.Ordinal);
         private static bool _placementComplete = false;
 
         private static readonly object _relaxationLock = new object();
 
         // Called when a vital type is attempting relaxation. Marks it as failed (drives Red) and records the attempt description for the live panel.
-        public static void MarkRelaxationAttempt(string prefabNameP, string attemptDescriptionP)
+        public static void MarkRelaxationAttempt(string prefabNameP, string attemptDescriptionP, bool isPrioritizedP)
         {
             lock (_relaxationLock)
             {
                 _relaxationFailed.Add(prefabNameP);
+                _failureSeverities[prefabNameP] = PlayabilityPolicy.GetSeverity(prefabNameP, isPrioritizedP);
+
                 bool hasLog = _relaxationAttemptLog.TryGetValue(prefabNameP, out List<string> log);
                 if (!hasLog)
                 {
@@ -72,13 +79,14 @@ namespace LPA
         }
 
         // Called from FlushLTS on any non-success. Marks the type as failed if PlayabilityPolicy says it still needs more placements.
-        public static void CheckAndMarkFailed(string prefabNameP, int placedP, int requestedP)
+        public static void CheckAndMarkFailed(string prefabNameP, int placedP, int requestedP, bool isPrioritizedP)
         {
             if (PlayabilityPolicy.NeedsRelaxation(prefabNameP, placedP, requestedP))
             {
                 lock (_relaxationLock)
                 {
                     _relaxationFailed.Add(prefabNameP);
+                    _failureSeverities[prefabNameP] = PlayabilityPolicy.GetSeverity(prefabNameP, isPrioritizedP);
                 }
                 GenerationProgress.UpdateText();
             }
@@ -105,12 +113,18 @@ namespace LPA
             lock (_relaxationLock)
             {
                 bool anyUnrescued = false;
+                FailureSeverity highestSeverity = FailureSeverity.Green;
+
                 foreach (string failed in _relaxationFailed)
                 {
                     if (!_relaxationSucceeded.Contains(failed))
                     {
                         anyUnrescued = true;
-                        break;
+                        bool hasSeverity = _failureSeverities.TryGetValue(failed, out FailureSeverity sev);
+                        if (hasSeverity && sev > highestSeverity)
+                        {
+                            highestSeverity = sev;
+                        }
                     }
                 }
 
@@ -136,7 +150,8 @@ namespace LPA
                     Succeeded = succeeded,
                     Exhausted = exhausted,
                     AttemptLog = new Dictionary<string, List<string>>(_relaxationAttemptLog, System.StringComparer.Ordinal),
-                    AnyRelaxationOccurred = _relaxationFailed.Count > 0
+                    AnyRelaxationOccurred = _relaxationFailed.Count > 0,
+                    HighestSeverity = highestSeverity
                 };
             }
         }
@@ -149,6 +164,7 @@ namespace LPA
                 _relaxationSucceeded.Clear();
                 _relaxationExhausted.Clear();
                 _relaxationAttemptLog.Clear();
+                _failureSeverities.Clear();
                 _placementComplete = false;
             }
         }

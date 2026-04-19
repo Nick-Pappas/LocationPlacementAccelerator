@@ -51,5 +51,8 @@
     <Reference Include="UnityEngine.TextRenderingModule">
       <HintPath>..\..\Libs\UnityEngine.TextRenderingModule.dll</HintPath>
     </Reference>
+    <Reference Include="YamlDotNet">
+      <HintPath>..\..\Libs\YamlDotNet.dll</HintPath>
+    </Reference>
   </ItemGroup>
 </Project>

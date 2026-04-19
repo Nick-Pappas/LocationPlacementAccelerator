@@ -10,6 +10,8 @@
 * Also holds transpiled-engine pipeline bookkeeping state:
 *   CurrentInstanceHash: set by OuterLoopPrefix, read by CaptureWrongBiome/Area.
 *   CachedOccupiedZone:  set on success, read by survey zone marking.
+*   
+* 1.0.1: Passed priority context into RelaxationTracker for UI severity grading.
 */
 #nullable disable
 using System;
@@ -193,7 +195,6 @@ namespace LPA
                         {
                             if (wasRelaxed)
                             {
-                                //DiagnosticLog.WriteTimestampedLog("Aahhhhh how comfortable", LogLevel.Message);
                                 DiagnosticLog.WriteTimestampedLog($"[RELAXATION SUCCESS] {prefab} placed {globalPlaced}/{origQty} after {relaxCount} relaxation(s). {ConstraintRelaxer.GetRelaxationSummary(prefab, loc)}", LogLevel.Message);
                             }
                             ReportFormatter.WriteReport(aggData, false, prefab);
@@ -212,7 +213,7 @@ namespace LPA
                         }
                         else
                         {
-                            RelaxationTracker.CheckAndMarkFailed(prefab, globalPlaced, origQty);
+                            RelaxationTracker.CheckAndMarkFailed(prefab, globalPlaced, origQty, aggData.Loc.m_prioritized);
                         }
                     }
                 }

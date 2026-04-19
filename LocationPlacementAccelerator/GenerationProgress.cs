@@ -1,4 +1,4 @@
-// v1
+// v2
 /**
 * Generation lifecycle management, placement counters, and UI text building.
 * Coordinates between placement engines, diagnostics, and the progress overlay.
@@ -12,6 +12,10 @@
 * But there's a lot of shared state and I don't want to risk synchronization bugs
 * by scattering it across multiple classes. 
 * One has to pick their battles.
+* 
+* v2: Added PlayabilityPolicy.Initialize() to dynamically load EWD YAML
+* configurations at the start of generation. Updated progress overlay colors
+* to respect FailureSeverity (Red/Orange/Yellow).
 */
 #nullable disable
 using BepInEx.Logging;
@@ -128,8 +132,8 @@ namespace LPA
             {
                 case PlacementMode.Survey: modeStr = "Survey"; break;
                 case PlacementMode.Filter: modeStr = "Filter"; break;
-                case PlacementMode.Force:  modeStr = "Force";  break;
-                default:                   modeStr = "Vanilla"; break;
+                case PlacementMode.Force: modeStr = "Force"; break;
+                default: modeStr = "Vanilla"; break;
             }
 
             string engineLabel = legacy ? "Transpiled" : "Replaced";
@@ -148,6 +152,8 @@ namespace LPA
                 return;
             }
             _initialized = true;
+
+            PlayabilityPolicy.Initialize();
 
             if (ModConfig.ShowGui.Value)
             {
@@ -287,7 +293,18 @@ namespace LPA
             }
             else if (snap.AnyUnrescued)
             {
-                color = "#FF4444";
+                if (snap.HighestSeverity == FailureSeverity.Red)
+                {
+                    color = "#FF4444";
+                }
+                else if (snap.HighestSeverity == FailureSeverity.Orange)
+                {
+                    color = "#FFAA00";
+                }
+                else
+                {
+                    color = "#FFFF55";
+                }
             }
             else
             {

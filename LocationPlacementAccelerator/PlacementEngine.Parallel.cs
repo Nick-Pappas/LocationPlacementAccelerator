@@ -1,10 +1,12 @@
-// v1.0.2
+// v1.0.3
 /**
 * Multi-threaded placement path for the replacement engine.
 *
 * 1.0.1: searchBiome in DrainWorkUnit widened to long to match the widened
 * ZoneProfile.BiomeMask so custom EWD biomes beyond bit 15 participate correctly.
 * 1.0.2: Sign-extension fix on the (long) cast. See my WorldSurveyData notes.
+* 1.0.3: Passed location priority into RelaxationTracker.CheckAndMarkFailed
+* to support accurate failure severity tracking (Red/Orange/Yellow).
 *
 * Architecture overview:
 *   1. BuildSpatialStreams groups location types by GTS (similarity group),
@@ -1002,7 +1004,7 @@ namespace LPA
                     int snap = zsP.m_locations.Count;
                     if (!ConstraintRelaxer.TryRelax(data))
                     {
-                        RelaxationTracker.CheckAndMarkFailed(prefab, globalPlaced, origQty);
+                        RelaxationTracker.CheckAndMarkFailed(prefab, globalPlaced, origQty, locP.m_prioritized);
                     }
                     else if (zsP.m_locations.Count > snap)
                     {
@@ -1193,7 +1195,7 @@ namespace LPA
                     int snap2 = zsP.m_locations.Count;
                     if (!ConstraintRelaxer.TryRelax(relaxData))
                     {
-                        RelaxationTracker.CheckAndMarkFailed(prefab, relaxGlobalPlaced, origQtyP);
+                        RelaxationTracker.CheckAndMarkFailed(prefab, relaxGlobalPlaced, origQtyP, relaxLocP.m_prioritized);
                     }
                     else if (zsP.m_locations.Count > snap2)
                     {
