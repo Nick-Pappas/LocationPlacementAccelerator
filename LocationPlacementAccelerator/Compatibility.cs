@@ -3,7 +3,7 @@
 * Detects and talks to companion mods (Better Continents, Expand World Size, Expand World Data).
 * Pulls in the world radius from whichever size-authority mod is present (EWS only as of 1.0.1).
 * Also publishes the high-relief biome mask for the replaced engine's 3D similarity fallback.
-* 
+*
 * EWD integration in 1.0.1:
 *  - Detection now looks at the actual field names on ExpandWorldData.WorldInfo
 *    (Radius / TotalRadius / Stretch / BiomeStretch), which was the long-standing bug that I kept putting off for 2 weeks... 
@@ -12,6 +12,22 @@
 *  - GetHighReliefBiomeMask reflects into ExpandWorldData.BiomeManager's BiomeToTerrain
 *    dictionary so custom biomes whose terrain algorithm is Mountain or Mistlands
 *    participate in the 3D similarity fallback the same way vanilla Mountain/Mistlands do.
+*
+* 1.0.2:
+*  - Added IsValidLocation(loc) mirroring EWD's own IsValid helper from IdManager.cs.
+*    This replaces the five places in the replaced engine where I was doing a strict
+*    "m_enable && m_prefab != null && m_prefab.IsValid" check. That check was silently
+*    filtering out every EWD blueprint-based location, because EWD builds those with
+*    an empty AssetID SoftReference (see SetupBlueprint in LocationLoading.cs.EWD:
+*    "location.m_prefab = new(new()) { m_name = name };"). SoftReference.IsValid
+*    checks the asset id, not the name, so blueprints come back as invalid. Vanilla
+*    doesn't care because its outer loop only filters on m_enable && m_quantity, and
+*    EWD patches PokeCanSpawnLocation to force-accept anything BlueprintManager knows
+*    about. My replaced engine bypasses both of those, so the safety check was
+*    gatekeeping the exact locations EWD was trying to add. EWD-mirror semantic below
+*    (IsValid OR name present) is what EWD itself uses for its own validity test and
+*    is the least-surprising, least-coupled fix. Jere does it, I do it too and call it
+*    a day.
 */
 #nullable disable
 using BepInEx.Bootstrap;
@@ -59,6 +75,46 @@ namespace LPA
         private static FieldInfo _ewdBiomeToTerrainField;
         private static Heightmap.Biome _cachedHighReliefMask = Heightmap.Biome.Mountain | Heightmap.Biome.Mistlands;
         private static bool _highReliefMaskComputed = false;
+
+        /**
+        * EWD-mirror validity predicate. Returns true if the location has a real
+        * asset (IsValid) OR at least a name on the SoftReference (the shape EWD
+        * gives blueprint locations: empty AssetID + m_name set). This is exactly
+        * the condition EWD's own IdManager.IsValid uses. I didn't want to couple
+        * to BlueprintManager directly because (a) that requires reflection across
+        * a soft-referenced assembly, and (b) any other mod that follows EWD's
+        * "empty-AssetID + name" pattern for runtime-built locations will also
+        * benefit from this, which is the right behavior.
+        *
+        * Call this anywhere the replaced engine was using
+        *     "loc.m_enable && loc.m_prefab != null && loc.m_prefab.IsValid"
+        * and fold m_enable / m_quantity into the surrounding check (this helper
+        * does not gate on either because the call sites have subtly different
+        * needs around enable/quantity filtering).
+        */
+        public static bool IsValidLocation(ZoneSystem.ZoneLocation locP)
+        {
+            if (locP == null)
+            {
+                return false;
+            }
+            if (locP.m_prefab == null)
+            {
+                return false;
+            }
+            // EWD's IdManager.IsValid uses exactly this disjunction. Matching it
+            // keeps us in lockstep with EWD's definition of "a placeable location"
+            // rather than inventing our own.
+            if (locP.m_prefab.IsValid)
+            {
+                return true;
+            }
+            if (locP.m_prefab.m_name != null)
+            {
+                return true;
+            }
+            return false;
+        }
 
         public static void Initialize(ManualLogSource loggerP)
         {

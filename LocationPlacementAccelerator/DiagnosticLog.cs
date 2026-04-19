@@ -28,14 +28,14 @@ namespace LPA
         public static void Initialize(string versionP)
         {
             Compatibility.Initialize(ModConfig.Log);
-            _runVersion = versionP.Replace(".", "");
+            _runVersion = versionP; //why the hell was I removing the .? ah for the filename..Replace(".", "");
         }
 
         public static string BuildFingerprint(string versionP = null)
         {
             if (versionP != null)
             {
-                _runVersion = versionP.Replace(".", "");
+                _runVersion = versionP; 
             }
 
             PlacementMode mode = ModConfig.EffectiveMode;

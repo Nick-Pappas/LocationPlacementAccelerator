@@ -1,4 +1,4 @@
-// v3
+// v5
 /**
 * Generation lifecycle management, placement counters, and UI text building.
 * Coordinates between placement engines, diagnostics, and the progress overlay.
@@ -23,6 +23,27 @@
 * which produced ridiculous percentages (140%+) on genloc-on-saved-world runs.
 * The snapshot is taken AFTER PlacementEngine.Run sweeps non-placed reservations,
 * so it represents only the real player-visited structures we are preserving.
+*
+* v4: Swapped the _validLocations filter from strict m_prefab.IsValid to 
+* Compatibility.IsValidLocation. EWD blueprint locations weren't counted in the
+* progress overlay's denominator (m_totalRequested), so the overlay reported a
+* lower "expected" count than what the engine was trying to place. This was 
+* mostly cosmetic because the engine itself was also dropping them (see Core
+* v1.0.4 / Parallel v1.0.4), but now that the engine accepts them the overlay
+* needs to agree on the total.
+*
+* v5: Fixed the genloc-on-saved-world reporting lie. "Requested" was using 
+* loc.m_quantity (world target) while "placed" was using GetActualPlacedCount 
+* (this run's deltas) - apples-to-oranges. For a quota that was already fully 
+* met (StartTemple, or any location that was placed and explored in a prior run), 
+* CenterFirstPlacer/Interleaver correctly skipped it, but then the summary paired 
+* requested=1 with placed=0 and printed "StartTemple: 0/1 Complete failure". 
+* Now both numbers are on the same scale: requested-this-run = m_quantity minus
+* preExisting, and locations whose quotas are already met are silently dropped
+* from the summary tables (they would contribute 0/0 otherwise, which is noise).
+* Also moved the _preExistingCounts snapshot above the _totalRequested sum so
+* the overlay denominator reflects "what this run still needs to do".
+* At this rate I will be v3googolplexes soon. 
 */
 #nullable disable
 using BepInEx.Logging;
@@ -190,27 +211,25 @@ namespace LPA
             }
             foreach (ZoneLocation loc in sourceList)
             {
-                if (loc.m_enable && loc.m_prefab != null && loc.m_prefab.IsValid)
+                // EWD-mirror: count blueprint locations in the "valid" set too. They
+                // arrive with an empty AssetID + name-only SoftReference, which the
+                // old m_prefab.IsValid check rejected - leaving them out of the 
+                // progress overlay's denominator even when the engine actually tried
+                // to place them. IsValidLocation matches EWD's own IdManager.IsValid.
+                if (loc.m_enable && Compatibility.IsValidLocation(loc))
                 {
                     _validLocations.Add(loc);
                 }
             }
 
-            int total = 0;
-            for (int i = 0; i < _validLocations.Count; i++)
-            {
-                total += _validLocations[i].m_quantity;
-            }
-            _totalRequested = total;
-            _currentProcessed = 0;
-            _currentPlaced = 0;
-            RelaxationTracker.Reset();
-
             /**
             * Snapshot the per-prefab counts that already exist in m_locationInstances
             * right now. PlacementEngine.Run has already swept non-placed reservations
             * so these are the genuine pre-existing placed structures from prior
-            * generations. EndGeneration will subtract these from the final tally.
+            * generations. Both the overlay denominator (_totalRequested) and the
+            * summary's per-location ratios subtract these so the numbers reflect
+            * "what this run still needs to do" rather than "world target vs this 
+            * run's deltas", which was reporting already-met quotas as 0/N failures.
             */
             _preExistingCounts.Clear();
             foreach (KeyValuePair<Vector2i, LocationInstance> kvp in zsP.m_locationInstances)
@@ -219,6 +238,22 @@ namespace LPA
                 _preExistingCounts.TryGetValue(prefabName, out int existing);
                 _preExistingCounts[prefabName] = existing + 1;
             }
+
+            int total = 0;
+            for (int i = 0; i < _validLocations.Count; i++)
+            {
+                ZoneLocation loc = _validLocations[i];
+                _preExistingCounts.TryGetValue(loc.m_prefabName, out int preExisting);
+                int needed = loc.m_quantity - preExisting;
+                if (needed > 0)
+                {
+                    total += needed;
+                }
+            }
+            _totalRequested = total;
+            _currentProcessed = 0;
+            _currentPlaced = 0;
+            RelaxationTracker.Reset();
 
             UpdateText();
         }
@@ -486,7 +521,17 @@ namespace LPA
                     continue;
                 }
 
-                int requested = loc.m_quantity;
+                /**
+                * Genloc fix: "requested" is what this run still needs to place, not 
+                * the world target. If a quota was already met in a prior run (e.g. 
+                * StartTemple sitting under the player's feet), CenterFirstPlacer / 
+                * Interleaver correctly skip it, and the engine has nothing to do - 
+                * that's not a failure. Without this subtraction the summary paired 
+                * an un-deducted requested (N) with GetActualPlacedCount's deducted 
+                * placed (0) and reported "0/N Complete failure" for healthy quotas.
+                */
+                _preExistingCounts.TryGetValue(loc.m_prefabName, out int preExisting);
+                int requested = loc.m_quantity - preExisting;
                 if (requested <= 0)
                 {
                     continue;

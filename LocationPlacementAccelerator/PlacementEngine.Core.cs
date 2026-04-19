@@ -1,4 +1,4 @@
-// v1.0.3
+// v1.0.4
 /**
 * Core of the replaced placement engine. This partial class contains:
 *  Run(): the entry-point coroutine called by ReplacedEnginePatches
@@ -31,6 +31,15 @@
 * LPA with vanilla's "non-placed reservations are disposable" semantic - real 
 * m_placed=true structures are preserved, stale m_placed=false reservations are 
 * swept so the placement pass starts from the same baseline as a fresh run.
+*
+* 1.0.4: Swapped the two strict m_prefab.IsValid pre-filters (partitions build 
+* around line 215, token-list build around line 619) to Compatibility.IsValidLocation.
+* EWD blueprint-based locations (Loki, Dhakhar's etc.) arrive with an empty AssetID and a 
+* name-only SoftReference, so the old IsValid check was silently dropping them 
+* before they ever got a token. See Compatibility.cs v1.0.2 header for the full 
+* story. The m_enable / m_quantity portions of each filter are kept inline because
+* the two sites have slightly different needs (partitions build doesn't gate on
+* quantity, token-list build does).
 */
 #nullable disable
 using System;
@@ -212,7 +221,11 @@ namespace LPA
             _groupPartitions = new Dictionary<string, HashSet<float>>(StringComparer.Ordinal);
             foreach (ZoneLocation loc in zsP.m_locations)
             {
-                if (!loc.m_enable || loc.m_prefab == null || !loc.m_prefab.IsValid)
+                // EWD-mirror check: blueprint locations arrive with an empty AssetID
+                // and only a name on the SoftReference. Compatibility.IsValidLocation
+                // accepts IsValid OR m_name != null, matching EWD's own IdManager.IsValid.
+                // Without this I was silently dropping every EWD blueprint location here.
+                if (!loc.m_enable || !Compatibility.IsValidLocation(loc))
                 {
                     continue;
                 }
@@ -616,7 +629,9 @@ namespace LPA
             for (int i = 0; i < zsP.m_locations.Count; i++)
             {
                 ZoneLocation loc = zsP.m_locations[i];
-                if (loc.m_enable && loc.m_prefab != null && loc.m_prefab.IsValid && loc.m_quantity > 0)
+                // EWD-mirror: accept blueprints (empty AssetID, name-only SoftReference)
+                // so they actually make it into the token list. Quantity check stays inline.
+                if (loc.m_enable && Compatibility.IsValidLocation(loc) && loc.m_quantity > 0)
                 {
                     eligible.Add(loc);
                 }

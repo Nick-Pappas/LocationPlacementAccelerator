@@ -1,4 +1,4 @@
-// v1.0.3
+// v1.0.4
 /**
 * Multi-threaded placement path for the replacement engine.
 *
@@ -7,6 +7,10 @@
 * 1.0.2: Sign-extension fix on the (long) cast. See my WorldSurveyData notes.
 * 1.0.3: Passed location priority into RelaxationTracker.CheckAndMarkFailed
 * to support accurate failure severity tracking (Red/Orange/Yellow).
+* 1.0.4: Swapped the strict m_prefab.IsValid filter in RunParallelPath's 
+* ordered-list build to Compatibility.IsValidLocation so EWD blueprint locations 
+* make it into the work queue. Same root cause as Core's 1.0.4; see Compatibility.cs
+* v1.0.2 header for the full story.
 *
 * Architecture overview:
 *   1. BuildSpatialStreams groups location types by GTS (similarity group),
@@ -154,7 +158,11 @@ namespace LPA
             for (int i = 0; i < srcLocations.Count; i++)
             {
                 ZoneLocation loc = srcLocations[i];
-                if (!loc.m_enable || loc.m_prefab == null || !loc.m_prefab.IsValid || loc.m_quantity <= 0)
+                // EWD-mirror: blueprint locations have an empty AssetID + name-only
+                // SoftReference. The old m_prefab.IsValid check rejected them before
+                // they ever hit the work queue. IsValidLocation matches EWD's own
+                // IdManager.IsValid so blueprints now survive into RunParallelPath.
+                if (!loc.m_enable || !Compatibility.IsValidLocation(loc) || loc.m_quantity <= 0)
                 {
                     continue;
                 }

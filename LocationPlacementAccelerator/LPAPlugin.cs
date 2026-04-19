@@ -12,7 +12,7 @@ using System.Reflection;
 
 namespace LPA
 {
-    [BepInPlugin("nickpappas.locationplacementaccelerator", "Location Placement Accelerator", "1.0.0")]
+    [BepInPlugin("nickpappas.locationplacementaccelerator", "Location Placement Accelerator", "1.0.2")]
     public class LPAPlugin : BaseUnityPlugin
     {
         private static Harmony _harmony;

@@ -1,4 +1,4 @@
-// v2
+// v3
 /**
 * Sequential placer for m_centerFirst locations (e.g. StartTemple / spawning altar).
 *
@@ -30,6 +30,10 @@
 * existed because StartTemple has m_unique=false. The PreEx + (quantity-1) 
 * interleave math in PlacementEngine_Core relies on at most 1 center-first 
 * instance per prefab being created here per run.
+*
+* v3: Swapped the strict m_prefab.IsValid pre-check for Compatibility.IsValidLocation.
+* If someone ever marks a blueprint location m_centerFirst (EWD lets them) the old
+* check would silently skip it. Matches Core / Parallel / GenerationProgress now.
 */
 #nullable disable
 using System.Collections.Generic;
@@ -57,7 +61,9 @@ namespace LPA
                 {
                     continue;
                 }
-                if (loc.m_prefab == null || !loc.m_prefab.IsValid)
+                // EWD-mirror: accept blueprint center-first locations too (name-only
+                // SoftReference). Matches IdManager.IsValid in EWD.
+                if (!Compatibility.IsValidLocation(loc))
                 {
                     continue;
                 }
