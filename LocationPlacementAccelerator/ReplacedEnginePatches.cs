@@ -1,4 +1,4 @@
-// v1
+// v2
 /**
 * Single Harmony patch class for the replaced engine.
 * Intercepts d__46 (GenerateLocationsTimeSliced outer coordinator) on its
@@ -8,6 +8,12 @@
 * This is the entire replaced engine patch surface. All V1 patches (transpilers, inner loop
 * prefix, GetRandomZone prefix, HaveLocationInRange prefix) are not registered
 * when the replaced engine is active. (see LPAPlugin.PatchCoroutines().)
+*
+* v2: Reset() is now also called from GenerationProgress.EndGeneration so a 
+* second `genloc` console command in the same session actually re-runs LPA. 
+* Previously the latches stayed set across runs and the prefix silently
+* suppressed every call after the first, making subsequent genlocs no-ops.
+* Game.Logout still calls Reset for the load-different-world case.
 */
 #nullable disable
 using HarmonyLib;
@@ -59,7 +65,8 @@ namespace LPA
             return false;
         }
 
-        // Called on Game.Logout so a fresh world generation gets a clean slate.
+        // Called on Game.Logout (fresh-world case) and on EndGeneration (re-arm 
+        // for a follow-up genloc in the same session).
         public static void Reset()
         {
             _firstCallDone = false;

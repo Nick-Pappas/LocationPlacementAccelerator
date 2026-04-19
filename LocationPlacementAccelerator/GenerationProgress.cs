@@ -1,4 +1,4 @@
-// v2
+// v3
 /**
 * Generation lifecycle management, placement counters, and UI text building.
 * Coordinates between placement engines, diagnostics, and the progress overlay.
@@ -16,6 +16,13 @@
 * v2: Added PlayabilityPolicy.Initialize() to dynamically load EWD YAML
 * configurations at the start of generation. Updated progress overlay colors
 * to respect FailureSeverity (Red/Orange/Yellow).
+*
+* v3: Snapshot pre-existing instance counts in StartGeneration so the EndGeneration
+* tally only credits LPA for what LPA actually added. Without this the summary
+* counts retained m_placed=true instances from prior generations as new placements,
+* which produced ridiculous percentages (140%+) on genloc-on-saved-world runs.
+* The snapshot is taken AFTER PlacementEngine.Run sweeps non-placed reservations,
+* so it represents only the real player-visited structures we are preserving.
 */
 #nullable disable
 using BepInEx.Logging;
@@ -37,6 +44,14 @@ namespace LPA
         private static DateTime _startTime;
 
         private static bool _isSurveying = false;
+
+        /**
+        * Per-prefab snapshot of instance counts as they exist at the very start of
+        * placement (after the non-placed sweep). The EndGeneration tally subtracts
+        * these so the percentages and "placed N/M" strings reflect what LPA placed
+        * this run, not what was already in the world from prior generations.
+        */
+        private static Dictionary<string, int> _preExistingCounts = new Dictionary<string, int>(StringComparer.Ordinal);
 
         public static bool IsSurveying
         {
@@ -191,6 +206,20 @@ namespace LPA
             _currentPlaced = 0;
             RelaxationTracker.Reset();
 
+            /**
+            * Snapshot the per-prefab counts that already exist in m_locationInstances
+            * right now. PlacementEngine.Run has already swept non-placed reservations
+            * so these are the genuine pre-existing placed structures from prior
+            * generations. EndGeneration will subtract these from the final tally.
+            */
+            _preExistingCounts.Clear();
+            foreach (KeyValuePair<Vector2i, LocationInstance> kvp in zsP.m_locationInstances)
+            {
+                string prefabName = kvp.Value.m_location.m_prefabName;
+                _preExistingCounts.TryGetValue(prefabName, out int existing);
+                _preExistingCounts[prefabName] = existing + 1;
+            }
+
             UpdateText();
         }
 
@@ -250,21 +279,33 @@ namespace LPA
             System.Threading.Interlocked.Add(ref _currentPlaced, countP);
         }
 
+        /**
+        * Returns the number of instances of this prefab placed BY LPA THIS RUN.
+        * Subtracts the pre-existing snapshot count taken at StartGeneration so
+        * retained m_placed=true instances from previous generations are not
+        * counted as new placements.
+        */
         private static int GetActualPlacedCount(string prefabNameP)
         {
             if (ZoneSystem.instance == null)
             {
                 return 0;
             }
-            int count = 0;
+            int total = 0;
             foreach (KeyValuePair<Vector2i, LocationInstance> kvp in ZoneSystem.instance.m_locationInstances)
             {
                 if (kvp.Value.m_location.m_prefabName == prefabNameP)
                 {
-                    count++;
+                    total++;
                 }
             }
-            return count;
+            _preExistingCounts.TryGetValue(prefabNameP, out int preExisting);
+            int placedThisRun = total - preExisting;
+            if (placedThisRun < 0)
+            {
+                placedThisRun = 0;
+            }
+            return placedThisRun;
         }
 
         public static void UpdateText()
@@ -570,6 +611,14 @@ namespace LPA
             ThreadSafePRNG.Reset();
             WorldSurveyData.Reset();
             SurveyMode.Reset();
+
+            /**
+            * Re-arm the engine prefix so a second genloc in the same session actually 
+            * runs again. Without this the first call latched _firstCallDone/_v2Started
+            * and every subsequent call just got suppressed silently.
+            */
+            ReplacedEnginePatches.Reset();
+
             _initialized = false;
         }
 

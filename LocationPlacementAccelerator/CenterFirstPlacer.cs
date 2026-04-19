@@ -1,4 +1,4 @@
-// v1
+// v2
 /**
 * Sequential placer for m_centerFirst locations (e.g. StartTemple / spawning altar).
 *
@@ -22,6 +22,14 @@
 * The outer iteration budget matches vanilla's inner-loop budget (20k × OuterMultiplier).
 * This runs synchronously on the main thread before the parallel batch.  
 * It's 1-2 locations budget exhaustion is not a concern.
+*
+* v2: Dedup check now fires for ALL center-first prefabs not just m_unique ones.
+* Vanilla only places 1 center-first instance per type (m_centerFirst implies the 
+* spiral-out semantic which is meaningless beyond the first placement). Without 
+* this, genloc-on-saved-world re-placed StartTemple even though one already 
+* existed because StartTemple has m_unique=false. The PreEx + (quantity-1) 
+* interleave math in PlacementEngine_Core relies on at most 1 center-first 
+* instance per prefab being created here per run.
 */
 #nullable disable
 using System.Collections.Generic;
@@ -54,22 +62,30 @@ namespace LPA
                     continue;
                 }
 
-                if (loc.m_unique)
+                /**
+                * If any instance of this prefab already exists in m_locationInstances,
+                * the center-first placement is already done. The non-placed sweep at the 
+                * top of PlacementEngine.Run guarantees that surviving entries are real
+                * spawned structures, so seeing one here means "the player already has 
+                * this thing in their world" and we must not double up on it. This 
+                * applies regardless of m_unique because m_centerFirst itself implies 
+                * a one-shot spiral-from-center semantic.
+                */
+                bool alreadyExists = false;
+                foreach (LocationInstance inst in zsP.m_locationInstances.Values)
                 {
-                    bool alreadyExists = false;
-                    foreach (LocationInstance inst in zsP.m_locationInstances.Values)
+                    if (inst.m_location.m_prefabName == loc.m_prefabName)
                     {
-                        if (inst.m_location.m_prefabName == loc.m_prefabName)
-                        {
-                            alreadyExists = true;
-                            break;
-                        }
+                        alreadyExists = true;
+                        break;
                     }
-                    if (alreadyExists)
-                    {
-                        placed.Add(loc.m_prefabName);
-                        continue;
-                    }
+                }
+                if (alreadyExists)
+                {
+                    placed.Add(loc.m_prefabName);
+                    DiagnosticLog.WriteTimestampedLog(
+                        $"[CenterFirstPlacer] {loc.m_prefabName}: already present in world, skipping center-first placement.");
+                    continue;
                 }
 
                 /**

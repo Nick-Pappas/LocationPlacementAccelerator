@@ -1,4 +1,4 @@
-// v1.0.2
+// v1.0.3
 /**
 * Core of the replaced placement engine. This partial class contains:
 *  Run(): the entry-point coroutine called by ReplacedEnginePatches
@@ -23,6 +23,14 @@
 * 
 * 1.0.2: Passed location priority into RelaxationTracker.CheckAndMarkFailed
 * to support accurate failure severity tracking (Red/Orange/Yellow).
+*
+* 1.0.3: Mirror vanilla's ClearNonPlacedLocations at the top of Run. Without this,
+* genloc on a saved world inherited every reservation vanilla had made during 
+* original generation as a hard occupancy claim. Modded location types competing 
+* for scarce biomes (Swamp, AshLands) had no zones left to land in. This re-aligns 
+* LPA with vanilla's "non-placed reservations are disposable" semantic - real 
+* m_placed=true structures are preserved, stale m_placed=false reservations are 
+* swept so the placement pass starts from the same baseline as a fresh run.
 */
 #nullable disable
 using System;
@@ -137,6 +145,32 @@ namespace LPA
             _generateLocationsProgressField = typeof(ZoneSystem).GetField(
                 "m_generateLocationsProgress",
                 BindingFlags.NonPublic | BindingFlags.Instance);
+
+            /**
+            * Vanilla GenerateLocationsTimeSliced opens with ClearNonPlacedLocations(),
+            * which keeps every m_placed=true entry (real spawned structures the player 
+            * has visited) and discards every m_placed=false entry (stale reservations
+            * from prior generations that never materialized). I bypass the entire 
+            * vanilla outer coroutine via the ReplacedEnginePatches prefix, so I have
+            * to do this myself or genloc-on-saved-world inherits every old reservation
+            * as a hard occupancy claim and starves modded locations in scarce biomes.
+            */
+            int beforeCount = zsP.m_locationInstances.Count;
+            Dictionary<Vector2i, LocationInstance> retained = new Dictionary<Vector2i, LocationInstance>();
+            foreach (KeyValuePair<Vector2i, LocationInstance> kvp in zsP.m_locationInstances)
+            {
+                if (kvp.Value.m_placed)
+                {
+                    retained.Add(kvp.Key, kvp.Value);
+                }
+            }
+            zsP.m_locationInstances = retained;
+            int sweptCount = beforeCount - retained.Count;
+            if (sweptCount > 0)
+            {
+                DiagnosticLog.WriteTimestampedLog(
+                    $"[LPA] Cleared {sweptCount} non-placed location reservations. Kept {retained.Count} placed instances.");
+            }
 
             Interleaver.InterleaveLocations(zsP);
             GenerationProgress.StartGeneration(zsP);

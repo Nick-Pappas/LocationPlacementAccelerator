@@ -1,4 +1,4 @@
-// v1
+// v1.0.3
 
 /**
 * Smart recovery system for vital location types. When a critical type
@@ -19,6 +19,10 @@
 * Removed massive hardcoded leaps on Unknown bottlenecks. Added clamping to ensure
 * land structures (MinAlt >= 0) are never relaxed to spawn underwater, and underwater
 * structures (MaxAlt <= 0) are never relaxed to spawn on land. 
+*
+* 1.0.3: Distance relaxation now clamps m_maxDistance to ModConfig.WorldRadius so 
+* I do not pretend to relax to a value beyond the actual playable disk. The min 
+* distance side already clamped to 0; max side now mirrors that with WorldRadius.
 */
 #nullable disable
 using System;
@@ -313,6 +317,15 @@ namespace LPA
                 {
                     float maxDistStep = Mathf.Max(1f, locP.m_maxDistance * mag);
                     locP.m_maxDistance += maxDistStep;
+                    /**
+                    * No point relaxing past the playable disk - any zone beyond WorldRadius
+                    * is empty and would just inflate the reported max in logs while doing
+                    * nothing useful. Mirrors the 0-floor on m_minDistance.
+                    */
+                    if (locP.m_maxDistance > ModConfig.WorldRadius)
+                    {
+                        locP.m_maxDistance = ModConfig.WorldRadius;
+                    }
                 }
 
                 if (locP.m_minDistance > 0f)

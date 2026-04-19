@@ -1,4 +1,4 @@
-// v2
+// v3
 /**
 * Defines which location types are vital for a playable world and their
 * minimum placement thresholds. Pure data + pure functions - no state.
@@ -13,6 +13,13 @@
 * from EWD's config folder. Overrides merge over hardcoded defaults using a 
 * last-write-wins (alphabetical file sort) strategy. Added severity tracking
 * to color-code UI failures based on priority and uniqueness.
+*
+* v3: Added _resolvedCache so GetEffectivePolicy does the hashmap+contains
+* dance once per prefab per generation, then O(1) on every subsequent call.
+* The four public methods (IsNecessity / NeedsRelaxation / GetMinimumNeededCount /
+* GetSeverity) all hit the same prefabs over and over during a single 
+* completion event so the redundancy adds up. Cleared inside Initialize 
+* alongside _yamlOverrides so config reloads pick up cleanly.
 */
 #nullable disable
 using System.Collections.Generic;
@@ -56,9 +63,18 @@ namespace LPA
 
         private static Dictionary<string, LocationYamlOverride> _yamlOverrides = new Dictionary<string, LocationYamlOverride>(System.StringComparer.Ordinal);
 
+        /**
+        * Per-prefab cache of fully-resolved EffectivePolicy structs. Each entry
+        * costs one dict lookup + 2 contains/trygetvalue calls to build, so caching
+        * cuts the four-method-per-completion repetition down to a single hash.
+        * Cleared inside Initialize so a YAML reload picks up the new overrides.
+        */
+        private static Dictionary<string, EffectivePolicy> _resolvedCache = new Dictionary<string, EffectivePolicy>(System.StringComparer.Ordinal);
+
         public static void Initialize()
         {
             _yamlOverrides.Clear();
+            _resolvedCache.Clear();
 
             try
             {
@@ -103,6 +119,19 @@ namespace LPA
         }
 
         private static EffectivePolicy GetEffectivePolicy(string prefabNameP)
+        {
+            bool hasCached = _resolvedCache.TryGetValue(prefabNameP, out EffectivePolicy cached);
+            if (hasCached)
+            {
+                return cached;
+            }
+
+            EffectivePolicy resolved = ResolvePolicy(prefabNameP);
+            _resolvedCache[prefabNameP] = resolved;
+            return resolved;
+        }
+
+        private static EffectivePolicy ResolvePolicy(string prefabNameP)
         {
             bool hasOverride = _yamlOverrides.TryGetValue(prefabNameP, out LocationYamlOverride yaml);
             if (hasOverride)
