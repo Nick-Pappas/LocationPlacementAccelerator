@@ -1,4 +1,4 @@
-// v1.0.2 
+// v1.0.4
 /**
 * Replaces vanilla's single-threaded Minimap.GenerateWorldMap() with a
 * parallel implementation. Intercepts the Minimap.Update() loop via a
@@ -8,12 +8,31 @@
 * 
 * For vanilla map of 10k radius on a 6 core machine we go from 7s to sub 2s. 
 * TODO: use the minimap info that I am ignoring in place of or in addition to the survey. 
-* 
+*
+* 1.0.3: Added Reset() called from TranspiledEnginePatches.OnGameLogout. Without 
+* it, _cacheChecked and GenerationComplete stayed true across Game.Logout, so on 
+* the second saved-world load of a session the cache gate was skipped, 
+* LaunchGeneration was called anyway, and it then nuked the perfectly good map 
+* cache on disk via DeleteMapTextureData before regenerating. Single-world-load 
+* path worked correctly before this fix; the multi-world lifecycle was the hole.
+*
+* 1.0.4 diagnostic blocks left in place, commented out. Wild goose chase, 
+* hair pulling. Every test scenario I could think of - fresh world, vanilla-
+* generated world loaded with LPA, LPA-generated world reloaded, logout-and-
+* reload without exiting, with and without MWL, with and without EWD - hit 
+* TryLoadMinimapTextureData correctly and returned true. Cannot reproduce the 
+* saved-world regeneration bug.
+* Either 1.0.3's Reset()-on-Logout fix silently addressed it too, or there's 
+* some state I haven't stumbled into yet (maybe EWS? something else?). Leaving 
+* the [LPA-DIAG] stuff in commented-out form so it can be re-enabled in 
+* 5 minutes if the bug reappears, rather than reinvented from scratch. 
+* I bet it will happen the second I compile this.
 */
 #nullable disable
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using HarmonyLib;
@@ -35,6 +54,15 @@ namespace LPA
 
         private static volatile int _rowsDone;
         private static int _totalRows;
+
+        // [LPA-DIAG] - per-session Prefix call counter. Reset() zeroes it so each 
+        // world load starts at call #1 again. Used to rate-limit the verbose logs, the first 10 Prefix calls log everything,
+        // after that we log only state transitions so we don't spam the log file with all those "waiting on task" lines.
+        // private static int _diagPrefixCallCount;
+
+        // [LPA-DIAG] - remembers whether the last Prefix call entered the cache block. Used to emit one "cache outcome" summary log line
+        // after the decision is made so we have a single find target for "what did we decide about the cache on this world load".
+        // private static bool _diagCacheOutcomeLogged;
 
         public static bool IsGenerating
         {
@@ -74,6 +102,19 @@ namespace LPA
         private static readonly AccessTools.FieldRef<Minimap, Color> _mistlandsColor =
             AccessTools.FieldRefAccess<Minimap, Color>("m_mistlandsColor");
 
+        // [LPA-DIAG] - path-string FieldRefs so I can read m_forestMaskTexturePath 
+        // etc. out of the Minimap instance at the exact moment my Prefix runs. 
+        // Vanilla populates these in Start() from ZNet.World.GetRootPath, so if my Prefix fires before those are populated I'll see empty strings here 
+        // and TryLoadMinimapTextureData will fail its first guard (string.IsNullOrEmpty check at line 336 of the vanilla source).
+        // private static readonly AccessTools.FieldRef<Minimap, string> _forestMaskTexturePath =
+        //     AccessTools.FieldRefAccess<Minimap, string>("m_forestMaskTexturePath");
+        //
+        // private static readonly AccessTools.FieldRef<Minimap, string> _mapTexturePath =
+        //     AccessTools.FieldRefAccess<Minimap, string>("m_mapTexturePath");
+        //
+        // private static readonly AccessTools.FieldRef<Minimap, string> _heightTexturePath =
+        //     AccessTools.FieldRefAccess<Minimap, string>("m_heightTexturePath");
+
         private static System.Reflection.MethodInfo _tryLoadMethod;
         private static System.Reflection.MethodInfo _loadMapDataMethod;
 
@@ -83,8 +124,64 @@ namespace LPA
             _loadMapDataMethod = AccessTools.Method(typeof(Minimap), "LoadMapData");
         }
 
+        /**
+        * Clears all static state. Called from TranspiledEnginePatches.OnGameLogout
+        * via the Game.Logout Harmony prefix. Without this, the second saved-world 
+        * load of a session sees _cacheChecked = true from the previous world, 
+        * skips the TryLoadMinimapTextureData path, enters LaunchGeneration, and 
+        * then DeleteMapTextureData nukes the good cache on disk before regenerating. 
+        * Not catastrophic but a couple seconds of burned CPU and pointless disk 
+        * churn every time someone reloads a saved world.
+        *
+        * If the task is still in flight at logout time (we exited to menu during 
+        * the initial 2-second generation), we drop our reference but the Parallel.For
+        * keeps running on the background threads until it finishes. Its closure still
+        * owns the buffer arrays, so nulling our fields here doesn't free them 
+        * immediately I think.
+        */
+        public static void Reset()
+        {
+            _started = false;
+            _cacheChecked = false;
+            _task = null;
+            _stopwatch = null;
+
+            _mapColors = null;
+            _maskColors = null;
+            _heights = null;
+            _heightPacked = null;
+
+            _rowsDone = 0;
+            _totalRows = 0;
+
+            GenerationComplete = false;
+            DeferredTimingMessage = null;
+
+            // [LPA-DIAG]
+            // _diagPrefixCallCount = 0;
+            // _diagCacheOutcomeLogged = false;
+        }
+
         public static bool Prefix(Minimap __instance)
         {
+            // [LPA-DIAG] - entry snapshot. Only the first 10 Prefix calls log 
+            // this in a verbose manner.
+            // _diagPrefixCallCount++;
+            // bool diagVerbose = _diagPrefixCallCount <= 10;
+            // if (diagVerbose)
+            // {
+            //     bool hasGeneratedAtEntry = _hasGenerated(__instance);
+            //     bool wgNull = WorldGenerator.instance == null;
+            //     bool bcActive = Compatibility.IsBetterContinentsActive;
+            //     ModConfig.Log.LogInfo(
+            //         $"[LPA-DIAG] Prefix #{_diagPrefixCallCount} entry: " +
+            //         $"m_hasGenerated={hasGeneratedAtEntry} " +
+            //         $"_cacheChecked={_cacheChecked} " +
+            //         $"_started={_started} " +
+            //         $"WorldGenerator.instance==null: {wgNull} " +
+            //         $"BC active: {bcActive}");
+            // }
+
             if (_hasGenerated(__instance))
             {
                 GenerationComplete = true;
@@ -103,6 +200,46 @@ namespace LPA
             if (!_cacheChecked)
             {
                 _cacheChecked = true;
+
+                // [LPA-DIAG] - this is hit this block once per world load (_cacheChecked). Capture everything I might want to know about why TryLoadMinimapTextureData succeeded or failed.
+                // DiagLogCacheAttempt(__instance);
+                //
+                // object rawReturn = null;
+                // Exception invokeException = null;
+                // try
+                // {
+                //     rawReturn = _tryLoadMethod.Invoke(__instance, null);
+                // }
+                // catch (Exception exP)
+                // {
+                //     // [LPA-DIAG] - vanilla's control log shows TryLoad succeeds on that vaaaaaaa world I made. If I am seeing an exception here that Harmony would otherwise swallow, THAT is the bug.
+                //     invokeException = exP;
+                // }
+                //
+                // [LPA-DIAG] - raw return value before the bool cast. If this is null, the `(bool)null` cast below would throw NullReferenceException and I 'd fall through to LaunchGeneration.
+                // That is the #1 suspect.
+                // ModConfig.Log.LogInfo(
+                //     $"[LPA-DIAG] TryLoadMinimapTextureData.Invoke returned: " +
+                //     $"{(rawReturn == null ? "NULL" : rawReturn.ToString())} " +
+                //     $"(type: {(rawReturn == null ? "<null>" : rawReturn.GetType().FullName)}) " +
+                //     $"exception: {(invokeException == null ? "<none>" : invokeException.GetType().Name + ": " + invokeException.Message)}");
+                // if (invokeException != null && invokeException.InnerException != null)
+                // {
+                //     ModConfig.Log.LogInfo(
+                //         $"[LPA-DIAG] TryLoad inner exception: " +
+                //         $"{invokeException.InnerException.GetType().Name}: {invokeException.InnerException.Message}");
+                // }
+                //
+                // bool cacheHit = false;
+                // if (invokeException == null && rawReturn is bool b)
+                // {
+                //     cacheHit = b;
+                // }
+                //
+                // _diagCacheOutcomeLogged = true;
+                // ModConfig.Log.LogInfo(
+                //     $"[LPA-DIAG] Cache outcome: {(cacheHit ? "HIT (will load and suppress Update)" : "MISS (will fall through to LaunchGeneration)")}");
+
                 if ((bool)_tryLoadMethod.Invoke(__instance, null))
                 {
                     _loadMapDataMethod.Invoke(__instance, null);
@@ -114,6 +251,10 @@ namespace LPA
 
             if (!_started)
             {
+                // [LPA-DIAG]  about to regenerate. One more sanity line so the log explicitly shows "yes, entering LaunchGeneration now".
+                // ModConfig.Log.LogInfo(
+                //     $"[LPA-DIAG] Prefix #{_diagPrefixCallCount}: entering LaunchGeneration " +
+                //     $"(_cacheOutcomeLogged={_diagCacheOutcomeLogged})");
                 LaunchGeneration(__instance);
                 _started = true;
                 return false;
@@ -153,6 +294,46 @@ namespace LPA
 
             return false;
         }
+
+        // [LPA-DIAG] - helper that pulls out everything I might care about at the moment of the cache-check. Vanilla's TryLoadMinimapTextureData gates on 
+        // (empty path OR missing file OR wrong worldVersion). I log each of the inputs to that gate so the log file tells us which one tripped when I get a MISS.
+        // private static void DiagLogCacheAttempt(Minimap instanceP)
+        // {
+        //     try
+        //     {
+        //         bool tryLoadMethodNull = _tryLoadMethod == null;
+        //
+        //         string forestPath = _forestMaskTexturePath(instanceP);
+        //         string mapPath = _mapTexturePath(instanceP);
+        //         string heightPath = _heightTexturePath(instanceP);
+        //
+        //         bool forestExists = !string.IsNullOrEmpty(forestPath) && File.Exists(forestPath);
+        //         bool mapExists = !string.IsNullOrEmpty(mapPath) && File.Exists(mapPath);
+        //         bool heightExists = !string.IsNullOrEmpty(heightPath) && File.Exists(heightPath);
+        //
+        //         int worldVersion = ZNet.World != null ? ZNet.World.m_worldVersion : -1;
+        //         string worldName = ZNet.World != null ? ZNet.World.m_name : "<ZNet.World null>";
+        //
+        //         ModConfig.Log.LogInfo(
+        //             $"[LPA-DIAG] Cache attempt state: " +
+        //             $"world='{worldName}' worldVersion={worldVersion} " +
+        //             $"_tryLoadMethod==null: {tryLoadMethodNull}");
+        //         ModConfig.Log.LogInfo(
+        //             $"[LPA-DIAG]   forestPath='{forestPath}' exists={forestExists}");
+        //         ModConfig.Log.LogInfo(
+        //             $"[LPA-DIAG]   mapPath='{mapPath}' exists={mapExists}");
+        //         ModConfig.Log.LogInfo(
+        //             $"[LPA-DIAG]   heightPath='{heightPath}' exists={heightExists}");
+        //     }
+        //     catch (Exception exP)
+        //     {
+        //         // [LPA-DIAG] - even the diagnostic can fail (reflection on path fields, ZNet.World null at the wrong moment, etc).
+        //         // Don't let it take down the real path. lol
+        //         ModConfig.Log.LogWarning(
+        //             $"[LPA-DIAG] DiagLogCacheAttempt itself threw: " +
+        //             $"{exP.GetType().Name}: {exP.Message}");
+        //     }
+        // }
 
         private static void LaunchGeneration(Minimap instanceP)
         {
@@ -249,9 +430,64 @@ namespace LPA
 
             if (FileHelpers.LocalStorageSupport == LocalStorageSupport.Supported)
             {
+                // [LPA-DIAG] - if the bug turns out to be "we never actually save the cache (wtf), so every load sees no file and regenerates", 
+                // then these logs tell us whether SaveMapTextureDataToDisk was resolved, whether the invocation threw, and whether the files 
+                // are actually present on disk when the method returns.
+                // System.Reflection.MethodInfo saveMethodDiag = AccessTools.Method(typeof(Minimap), "SaveMapTextureDataToDisk");
+                // bool saveMethodResolved = saveMethodDiag != null;
+                // ModConfig.Log.LogInfo(
+                //     $"[LPA-DIAG] UploadTextures: SaveMapTextureDataToDisk resolved={saveMethodResolved}");
+                //
+                // Exception saveException = null;
+                // Stopwatch saveWatch = Stopwatch.StartNew();
+                // try
+                // {
+                //     if (saveMethodResolved)
+                //     {
+                //         saveMethodDiag.Invoke(instanceP, new object[] { _forestMaskTexture(instanceP), _mapTexture(instanceP), packedTex });
+                //     }
+                // }
+                // catch (Exception exP)
+                // {
+                //     saveException = exP;
+                // }
+                // saveWatch.Stop();
+                //
+                // if (saveException == null)
+                // {
+                //     // [LPA-DIAG] - post-save file existence check. If these say  "false" after an apparently-successful save, SaveMapTextureDataToDisk 
+                //     // hit its own early-return guard (empty path string) and silently did nothing. Cannot be but, pure sanity check.
+                //     string forestPath = _forestMaskTexturePath(instanceP);
+                //     string mapPath = _mapTexturePath(instanceP);
+                //     string heightPath = _heightTexturePath(instanceP);
+                //     bool forestOnDisk = !string.IsNullOrEmpty(forestPath) && File.Exists(forestPath);
+                //     bool mapOnDisk = !string.IsNullOrEmpty(mapPath) && File.Exists(mapPath);
+                //     bool heightOnDisk = !string.IsNullOrEmpty(heightPath) && File.Exists(heightPath);
+                //     ModConfig.Log.LogInfo(
+                //         $"[LPA-DIAG] UploadTextures: save took {saveWatch.ElapsedMilliseconds}ms. " +
+                //         $"forest-on-disk={forestOnDisk} map-on-disk={mapOnDisk} height-on-disk={heightOnDisk}");
+                // }
+                // else
+                // {
+                //     ModConfig.Log.LogError(
+                //         $"[LPA-DIAG] UploadTextures: SaveMapTextureDataToDisk threw: " +
+                //         $"{saveException.GetType().Name}: {saveException.Message}");
+                //     if (saveException.InnerException != null)
+                //     {
+                //         ModConfig.Log.LogError(
+                //             $"[LPA-DIAG] Inner: {saveException.InnerException.GetType().Name}: {saveException.InnerException.Message}");
+                //     }
+                // }
+
                 System.Reflection.MethodInfo saveMethod = AccessTools.Method(typeof(Minimap), "SaveMapTextureDataToDisk");
                 saveMethod?.Invoke(instanceP, new object[] { _forestMaskTexture(instanceP), _mapTexture(instanceP), packedTex });
             }
+            // [LPA-DIAG] - if we're in a build where LocalStorageSupport isn't supported we'd never save.Irrelevant for a pc but again everything and the kitchen sink
+            // else
+            // {
+            //     ModConfig.Log.LogInfo(
+            //         $"[LPA-DIAG] UploadTextures: FileHelpers.LocalStorageSupport={FileHelpers.LocalStorageSupport}, skipping disk save.");
+            // }
         }
 
         private static readonly Color32 White32 = new Color32(255, 255, 255, 255);

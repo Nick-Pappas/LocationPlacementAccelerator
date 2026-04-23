@@ -1,6 +1,10 @@
-// v1.3c
+// v1.1
 /**
 * Harmony transpiler patches for the transpiled engine path.
+*
+* v1.1: OnGameLogout now also calls MinimapParallelizer.Reset() so the minimap
+* parallelizer's _cacheChecked / GenerationComplete latches do not leak across
+* saved-world reloads in the same session.
 *
 * How it all started:
 *
@@ -52,28 +56,28 @@
 * OpCodes is a .NET enumeration that defines every possible IL verb.
 *
 * Key opcodes used in this file:
-*   Ldc_I4      — "Load Constant, Integer 4-byte." Pushes an int onto the stack.
+*   Ldc_I4      - "Load Constant, Integer 4-byte." Pushes an int onto the stack.
 *                 Ldc_I4 100000 means "push the number 100000."
-*   Ldc_I4_S    — Same but for small constants (fits in a signed byte). Ldc_I4_S 20.
-*   Ldc_I4_1    — Shorthand for Ldc_I4 1. Pushes the number 1.
-*   Ldc_R8      — "Load Constant, Real 8-byte." Pushes a double. Ldc_R8 30.0 is
+*   Ldc_I4_S    - Same but for small constants (fits in a signed byte). Ldc_I4_S 20.
+*   Ldc_I4_1    - Shorthand for Ldc_I4 1. Pushes the number 1.
+*   Ldc_R8      - "Load Constant, Real 8-byte." Pushes a double. Ldc_R8 30.0 is
 *                 vanilla's water plane altitude (ZoneSystem.m_waterLevel = 30f).
-*   Ldfld       — "Load Field." Pops an object, pushes the value of one of its fields.
-*   Stfld       — "Store Field." Pops a value and an object, writes the value into a field.
-*   Ldflda      — "Load Field Address." Like Ldfld but pushes the address (ref/out).
-*   Ldarg_0     — Pushes 'this' (the state machine instance, since MoveNext is instance).
-*   Ldloc_S     — "Load Local (Short)." Pushes a local variable by index.
-*   Stloc_S     — "Store Local (Short)." Pops into a local variable.
-*   Ldstr       — "Load String." Pushes a string constant. Vanilla uses Ldstr "error..."
+*   Ldfld       - "Load Field." Pops an object, pushes the value of one of its fields.
+*   Stfld       - "Store Field." Pops a value and an object, writes the value into a field.
+*   Ldflda      - "Load Field Address." Like Ldfld but pushes the address (ref/out).
+*   Ldarg_0     - Pushes 'this' (the state machine instance, since MoveNext is instance).
+*   Ldloc_S     - "Load Local (Short)." Pushes a local variable by index.
+*   Stloc_S     - "Store Local (Short)." Pops into a local variable.
+*   Ldstr       - "Load String." Pushes a string constant. Vanilla uses Ldstr "error..."
 *                 for its error counter logging, which is how we identify error fields.
-*   Call        — Calls a method. The operand is a MethodInfo.
-*   Callvirt    — Calls a virtual method.
-*   Br / Br_S   — Unconditional branch (goto). Operand is a Label.
-*   Brtrue      — Branch if the top of stack is true/nonzero.
-*   Add         — Pops two values, pushes their sum. Used in "counter++" patterns.
-*   Dup         — Duplicates the top of stack (push a copy).
-*   Pop         — Discards the top of stack.
-*   Ret         — Return from method.
+*   Call        - Calls a method. The operand is a MethodInfo.
+*   Callvirt    - Calls a virtual method.
+*   Br / Br_S   - Unconditional branch (goto). Operand is a Label.
+*   Brtrue      - Branch if the top of stack is true/nonzero.
+*   Add         - Pops two values, pushes their sum. Used in "counter++" patterns.
+*   Dup         - Duplicates the top of stack (push a copy).
+*   Pop         - Discards the top of stack.
+*   Ret         - Return from method.
 *
 * C# pattern matching in IL scanning, the chain idiom...
 *
@@ -147,7 +151,7 @@ namespace LPA
         * PatchProcessor.GetOriginalInstructions() returns the raw IL instruction list for a method.
         * Each CodeInstruction has an .opcode (the verb) and an .operand (the object).
         * Here: opcode == OpCodes.Call means "this instruction calls a method", and
-        * operand is MethodInfo mi means "the operand is a method reference — extract it into mi",
+        * operand is MethodInfo mi means "the operand is a method reference - extract it into mi",
         * then mi.Name == "GetRandomPointInZone" checks if it's the method we are looking for.
         */
         public static bool ScanForInnerLoop(MethodInfo methodP)
@@ -194,6 +198,8 @@ namespace LPA
         public static void OnGameLogout()
         {
             GenerationProgress.ForceCleanup();
+            // The minimap parallelizer's cache-check and GenerationComplete latches are Unity-session-scoped, not world-scoped. Well I think so as I cannot replicate the regen bug. 
+            MinimapParallelizer.Reset();
         }
 
         private static object _outerLoopInstance = null;
@@ -223,8 +229,7 @@ namespace LPA
         {
             _outerLoopInstance = __instance;
 
-            // MoveNext() executes every frame the coroutine is active.
-            // I MUST only clear the memory if I am at the very beginning of map generation.
+            // MoveNext() executes every frame the coroutine is active. I MUST only clear the memory if I am at the very beginning of map generation.
             if (!Interleaver.IsGenerating)
             {
                 _reportedViaExhaustion.Clear();
@@ -529,10 +534,10 @@ namespace LPA
             FieldInfo limitFieldFound = null;
             for (int i = 0; i < codes.Count; i++)
             {
-                // "Push integer 100000 or 200000" — this is vanilla's budget constant.
+                // "Push integer 100000 or 200000" - this is vanilla's budget constant.
                 if (codes[i].opcode == OpCodes.Ldc_I4 && codes[i].operand is int v && (v == 100000 || v == 200000))
                 {
-                    // Look ahead up to 5 instructions for a Stfld — the field being written to.
+                    // Look ahead up to 5 instructions for a Stfld - the field being written to.
                     for (int k = 1; k <= 5 && i + k < codes.Count; k++)
                     {
                         if (codes[i + k].opcode == OpCodes.Stfld)
@@ -559,9 +564,11 @@ namespace LPA
             {
                 CodeInstruction instruction = codes[i];
 
-                // Budget replacement: where vanilla pushes 100000 or 200000, we instead push
-                // the ZoneLocation and the base budget, then call Interleaver.GetBudget(loc, base)
-                // which returns the actual budget (may be multiplied by OuterMultiplier).
+                /**
+                * Budget replacement: where vanilla pushes 100000 or 200000, we instead push
+                * the ZoneLocation and the base budget, then call Interleaver.GetBudget(loc, base)
+                * which returns the actual budget (may be multiplied by OuterMultiplier).
+                */
                 if (instruction.opcode == OpCodes.Ldc_I4 && instruction.operand is int v && (v == 100000 || v == 200000))
                 {
                     List<CodeInstruction> loadInsts = new List<CodeInstruction>(GetLocationLoadInstructions(codes, i));
@@ -610,14 +617,13 @@ namespace LPA
                     yield return instruction;
                 }
 
-                // Timestamp hook: after vanilla stores its start time, inject our own start marker.
                 if (instruction.opcode == OpCodes.Stfld && instruction.operand is FieldInfo stf
                     && stf.FieldType == typeof(DateTime) && stf.Name.Contains("startTime"))
                 {
                     yield return new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(GenerationProgress), nameof(GenerationProgress.MarkActualStart)));
                 }
 
-                // New location hook: when vanilla stores a new ZoneLocation into its field,we inject a call to reset our per-location state (survey exhaustion flag, counters).
+          
                 if (codes[i].opcode == OpCodes.Stfld && codes[i].operand is FieldInfo fi && fi.FieldType == typeof(ZoneLocation))
                 {
                     yield return new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(TranspiledEnginePatches), nameof(TranspiledEnginePatches.ResetAndPrepareForNewLocation)));
@@ -676,7 +682,7 @@ namespace LPA
             string lastLogString = "";
             FieldInfo limitFieldFound = null;
 
-            // PASS 1 — Walk the IL once to discover and cache compiler-generated field references.
+            // PASS 1 - Walk the IL once to discover and cache compiler-generated field references.
             for (int i = 0; i < codes.Count; i++)
             {
                 CodeInstruction instruction = codes[i];
@@ -735,7 +741,7 @@ namespace LPA
             }
 
             /**
-            * PASS 1.5 — Filter chain reorder.
+            * PASS 1.5 - Filter chain reorder.
             * Vanilla's d__48 checks terrain delta BEFORE similarity. I swap them so
             * similarity (a single PresenceGrid bit read when using the replaced engine,
             * or a zone-neighborhood scan when using the transpiled engine) runs first.
@@ -838,7 +844,7 @@ namespace LPA
 
                 // Placed count proxy: replace vanilla's CountNrOfLocation with our version
                 // that returns 0 during interleaved scheduling (we track counts ourselves).
-                // Also discover the "placed" field — the field that receives the count.
+                // Also discover the "placed" field - the field that receives the count.
                 if (opcode == OpCodes.Call && operand is MethodInfo miCount && miCount.Name == "CountNrOfLocation")
                 {
                     if (i + 1 < codes.Count && codes[i + 1].opcode == OpCodes.Stfld)
@@ -852,7 +858,7 @@ namespace LPA
                     continue;
                 }
 
-                // Budget replacement, (same as in OuterLoopTranspiler — replace 100k/200k with GetBudget).
+                // Budget replacement, (same as in OuterLoopTranspiler - replace 100k/200k with GetBudget).
                 if (opcode == OpCodes.Ldc_I4 && operand is int val && (val == 100000 || val == 200000))
                 {
                     CodeInstruction newInst = new CodeInstruction(OpCodes.Ldarg_0);
@@ -942,8 +948,6 @@ namespace LPA
                     }
                 }
 
-                // Failure callback: vanilla pushes "Failed to place all ..." before logging a warning.
-                // We inject ReportFailure right before that string so our completion handler fires.
                 if (opcode == OpCodes.Ldstr && operand is string str && str.Contains("Failed to place all"))
                 {
                     yield return new CodeInstruction(OpCodes.Ldarg_0);

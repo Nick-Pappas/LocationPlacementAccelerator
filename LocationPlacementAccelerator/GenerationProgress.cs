@@ -1,4 +1,4 @@
-// v5
+// v6 
 /**
 * Generation lifecycle management, placement counters, and UI text building.
 * Coordinates between placement engines, diagnostics, and the progress overlay.
@@ -13,37 +13,19 @@
 * by scattering it across multiple classes. 
 * One has to pick their battles.
 * 
-* v2: Added PlayabilityPolicy.Initialize() to dynamically load EWD YAML
-* configurations at the start of generation. Updated progress overlay colors
-* to respect FailureSeverity (Red/Orange/Yellow).
+* ForceCleanup now clears every static the overlay reads, not just _initialized. 
+* On saved-world loads the Minimap parallelizer creates the overlay to show its 
+* own progress bar; if it came back to stale StaticTopText and counters, the 
+* overlay's line-78 gate stayed open after minimap gen finished and the panel 
+* kept rendering "Finished /" with last session's numbers forever.
 *
-* v3: Snapshot pre-existing instance counts in StartGeneration so the EndGeneration
-* tally only credits LPA for what LPA actually added. Without this the summary
-* counts retained m_placed=true instances from prior generations as new placements,
-* which produced ridiculous percentages (140%+) on genloc-on-saved-world runs.
-* The snapshot is taken AFTER PlacementEngine.Run sweeps non-placed reservations,
-* so it represents only the real player-visited structures we are preserving.
-*
-* v4: Swapped the _validLocations filter from strict m_prefab.IsValid to 
-* Compatibility.IsValidLocation. EWD blueprint locations weren't counted in the
-* progress overlay's denominator (m_totalRequested), so the overlay reported a
-* lower "expected" count than what the engine was trying to place. This was 
-* mostly cosmetic because the engine itself was also dropping them (see Core
-* v1.0.4 / Parallel v1.0.4), but now that the engine accepts them the overlay
-* needs to agree on the total.
-*
-* v5: Fixed the genloc-on-saved-world reporting lie. "Requested" was using 
-* loc.m_quantity (world target) while "placed" was using GetActualPlacedCount 
-* (this run's deltas) - apples-to-oranges. For a quota that was already fully 
-* met (StartTemple, or any location that was placed and explored in a prior run), 
-* CenterFirstPlacer/Interleaver correctly skipped it, but then the summary paired 
-* requested=1 with placed=0 and printed "StartTemple: 0/1 Complete failure". 
-* Now both numbers are on the same scale: requested-this-run = m_quantity minus
-* preExisting, and locations whose quotas are already met are silently dropped
-* from the summary tables (they would contribute 0/0 otherwise, which is noise).
-* Also moved the _preExistingCounts snapshot above the _totalRequested sum so
-* the overlay denominator reflects "what this run still needs to do".
-* At this rate I will be v3googolplexes soon. 
+* EndGeneration reporting:
+*   "requested" uses (m_quantity - preExisting) so both it and "placed" are on 
+*   the same scale. Quotas already fully met by pre-existing instances drop out 
+*   of the summary entirely (would otherwise report as "0/N failure" chich is
+*   what I was seeing in Strike's logs on Discord for healthy locations like 
+*   StartTemple on genloc-on-saved-world). _totalRequested (the 
+*   overlay denominator) uses the same deducted value so it matches mid-run.
 */
 #nullable disable
 using BepInEx.Logging;
@@ -211,11 +193,7 @@ namespace LPA
             }
             foreach (ZoneLocation loc in sourceList)
             {
-                // EWD-mirror: count blueprint locations in the "valid" set too. They
-                // arrive with an empty AssetID + name-only SoftReference, which the
-                // old m_prefab.IsValid check rejected - leaving them out of the 
-                // progress overlay's denominator even when the engine actually tried
-                // to place them. IsValidLocation matches EWD's own IdManager.IsValid.
+                // EWD-mirror: count blueprint locations in the "valid" set too.
                 if (loc.m_enable && Compatibility.IsValidLocation(loc))
                 {
                     _validLocations.Add(loc);
@@ -670,6 +648,27 @@ namespace LPA
         public static void ForceCleanup()
         {
             ProgressOverlay.DestroyInstance();
+
+            /**
+            * Clear every static that the overlay reads. Without this, a later
+            * Minimap regeneration pass (which calls ProgressOverlay.EnsureInstance
+            * to show its own progress) will come back to a brand-new overlay 
+            * GameObject that inherits stale StaticTopText and counter values from
+            * the prior session. The line-78 gate in ProgressOverlay.OnGUI only
+            * early-returns when StaticTopText is empty, so stale text keeps the
+            * panel alive forever, showing "Finished /" with last session's numbers.
+            */
+            StaticTopText = "";
+            StaticBottomText = "";
+            _totalRequested = 0;
+            _currentProcessed = 0;
+            _currentPlaced = 0;
+            CurrentLocation = null;
+            _threadSlots = null;
+            _validLocations.Clear();
+            _preExistingCounts.Clear();
+            _isSurveying = false;
+
             _initialized = false;
         }
     }

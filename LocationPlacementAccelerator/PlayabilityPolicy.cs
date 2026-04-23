@@ -1,4 +1,4 @@
-// v3
+// v4
 /**
 * Defines which location types are vital for a playable world and their
 * minimum placement thresholds. Pure data + pure functions - no state.
@@ -20,11 +20,12 @@
 * GetSeverity) all hit the same prefabs over and over during a single 
 * completion event so the redundancy adds up. Cleared inside Initialize 
 * alongside _yamlOverrides so config reloads pick up cleanly.
+*
+* v4: Gate YAML loading on EWD actually being present. 
 */
 #nullable disable
 using System.Collections.Generic;
 using UnityEngine;
-using YamlDotNet.Serialization;
 using BepInEx;
 
 namespace LPA
@@ -63,19 +64,29 @@ namespace LPA
 
         private static Dictionary<string, LocationYamlOverride> _yamlOverrides = new Dictionary<string, LocationYamlOverride>(System.StringComparer.Ordinal);
 
-        /**
-        * Per-prefab cache of fully-resolved EffectivePolicy structs. Each entry
-        * costs one dict lookup + 2 contains/trygetvalue calls to build, so caching
-        * cuts the four-method-per-completion repetition down to a single hash.
-        * Cleared inside Initialize so a YAML reload picks up the new overrides.
-        */
         private static Dictionary<string, EffectivePolicy> _resolvedCache = new Dictionary<string, EffectivePolicy>(System.StringComparer.Ordinal);
+
 
         public static void Initialize()
         {
             _yamlOverrides.Clear();
             _resolvedCache.Clear();
 
+            if (!Compatibility.IsExpandWorldDataActive)
+            {
+                return;
+            }
+
+            LoadYamlOverrides();
+        }
+
+        /**
+        * The YamlDotNet-touching half of Initialize. Called only when EWD is 
+        * active, which guarantees YamlDotNet.dll is on disk (it's a hard dep 
+        * of EWD itself). 
+        */
+        private static void LoadYamlOverrides()
+        {
             try
             {
                 string dir = System.IO.Path.Combine(Paths.ConfigPath, "expand_world");
@@ -87,7 +98,7 @@ namespace LPA
                 string[] files = System.IO.Directory.GetFiles(dir, "expand_locations*.yaml");
                 System.Array.Sort(files);
 
-                IDeserializer deserializer = new DeserializerBuilder()
+                YamlDotNet.Serialization.IDeserializer deserializer = new YamlDotNet.Serialization.DeserializerBuilder()
                     .IgnoreUnmatchedProperties()
                     .Build();
 
