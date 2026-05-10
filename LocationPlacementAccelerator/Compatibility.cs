@@ -1,4 +1,4 @@
-// v1.0.2
+// v1.0.3
 /**
 * Detects and talks to companion mods (Better Continents, Expand World Size, Expand World Data).
 * Pulls in the world radius from whichever size-authority mod is present (EWS only as of 1.0.1).
@@ -28,6 +28,25 @@
 *    (IsValid OR name present) is what EWD itself uses for its own validity test and
 *    is the least-surprising, least-coupled fix. Jere does it, I do it too and call it
 *    a day.
+*
+* 1.0.3 (BC fail-safe):
+*    - The MinimapGenerationComplete event hook only exists on my BC fork; stock 
+*      upstream BC has no such event. Previous logic in the three error branches 
+*      (bcType missing, event missing, exception during subscription) just logged 
+*      a warning and returned, leaving BCMinimapDone permanently false. Combined 
+*      with the gate in PlacementEngine.Run that yields until BCMinimapDone is 
+*      true, this meant any stock-BC + LPA user would deadlock the placement 
+*      coroutine on world load - LPA's survey would never start, no locations 
+*      would be placed, world would appear empty. Silent because LPA's outer 
+*      prefix returns false from call #2 onward, so vanilla's location 
+*      generation also doesn't run. So in each error branch, set 
+*      BCMinimapDone = true so the wait short-circuits. Of course the trade-off is
+*      that stock-BC users get LPA workers (N-2) running concurrently with BC's hardcoded 
+*      4 minimap threads instead of cleanly serialized as on my fork. Mild 
+*      oversubscription for ~2s on a 6+ core machine. Worth it! ANY behavior 
+*      beats hung locations. Push the BC PR upstream when I get a chance to 
+*      restore the clean serialized path. I need to remember to talk to Jere about this.
+*      
 */
 #nullable disable
 using BepInEx.Bootstrap;
@@ -71,26 +90,25 @@ namespace LPA
 
         // EWD high-relief support. Populated once on first call after EWD is detected.
         // Maps custom biome values to their vanilla terrain classification (Mountain, Mistlands, etc.).
+        // I need to think what I will be doing with my better map and also  my multilevel mountains. meh... later. 
         private static Type _ewdBiomeManagerType;
         private static FieldInfo _ewdBiomeToTerrainField;
         private static Heightmap.Biome _cachedHighReliefMask = Heightmap.Biome.Mountain | Heightmap.Biome.Mistlands;
         private static bool _highReliefMaskComputed = false;
 
         /**
-        * EWD-mirror validity predicate. Returns true if the location has a real
-        * asset (IsValid) OR at least a name on the SoftReference (the shape EWD
-        * gives blueprint locations: empty AssetID + m_name set). This is exactly
-        * the condition EWD's own IdManager.IsValid uses. I didn't want to couple
-        * to BlueprintManager directly because (a) that requires reflection across
-        * a soft-referenced assembly, and (b) any other mod that follows EWD's
-        * "empty-AssetID + name" pattern for runtime-built locations will also
-        * benefit from this, which is the right behavior.
+        * Returns true if the location has a realasset (IsValid) OR at least a name on the SoftReference (the shape EWD
+        * gives blueprint locations: empty AssetID + m_name set). This is exactly the condition EWD's own 
+        * IdManager.IsValid uses. I didn't want to couple to BlueprintManager directly because (a) that requires reflection across
+        * a soft-referenced assembly, and (b) any other mod that follows EWD's "empty-AssetID + name" pattern for runtime-built locations will also
+        * benefit from this, which is the right and noble behavior.
         *
-        * Call this anywhere the replaced engine was using
-        *     "loc.m_enable && loc.m_prefab != null && loc.m_prefab.IsValid"
-        * and fold m_enable / m_quantity into the surrounding check (this helper
-        * does not gate on either because the call sites have subtly different
-        * needs around enable/quantity filtering).
+        * Call this anywhere the replaced engine was using "loc.m_enable && loc.m_prefab != null && loc.m_prefab.IsValid"
+        * and fold m_enable / m_quantity into the surrounding check (this helper does not gate on either because the call sites have 
+        * different needs around enable/quantity filtering).
+        * 
+        * I may have to rewrite the comment here. I found myself reading the above thing thrice in what... a week later?
+        * no chance I follow or remember by July.
         */
         public static bool IsValidLocation(ZoneSystem.ZoneLocation locP)
         {
@@ -137,9 +155,9 @@ namespace LPA
 
         /**
         * Resolves the effective world radius. EWS is the sole size authority.
-        * EWD presence is diagnostic only: EWD mirrors whatever radius EWS (or BC) pushes
+        * EWD presence is diagnostic only: EWD mirrors whatever radius EWS (or BC although BC yields to EWS) pushes
         * via its own WorldInfo.Set, so reading EWD's radius here would double-count
-        * or conflict. Vanilla default of 10000m applies when EWS is not present.
+        * or conflict. Vanilla default of 10000m applies when EWS is not present. 
         */
         public static float RefreshWorldRadius(ManualLogSource loggerP)
         {
@@ -280,7 +298,7 @@ namespace LPA
         /**
         * Logs EWD's current world info fields. Purely diagnostic. Helps us notice
         * if EWS and EWD disagree about world size at runtime (which would indicate
-        * a config mistake on the user's side).
+        * a config mistake on the user's side). Basically this should not happen. 
         */
         private static void LogEWDWorldInfoSnapshot(ManualLogSource loggerP)
         {
@@ -329,6 +347,7 @@ namespace LPA
                 if (bcType == null)
                 {
                     loggerP.LogWarning("[LPACompatibility] BC: BetterContinents type not found - minimap wait disabled.");
+                    BCMinimapDone = true;
                     return;
                 }
 
@@ -338,6 +357,7 @@ namespace LPA
                 if (minimapCompleteEvent == null)
                 {
                     loggerP.LogWarning("[LPACompatibility] BC: MinimapGenerationComplete event not found - minimap wait disabled.");
+                    BCMinimapDone = true;
                     return;
                 }
 
@@ -347,6 +367,7 @@ namespace LPA
             catch (Exception exP)
             {
                 loggerP.LogWarning($"[LPACompatibility] BC: Event subscription failed - minimap wait disabled. {exP.Message}");
+                BCMinimapDone = true;
             }
         }
 
@@ -396,9 +417,10 @@ namespace LPA
         * Also caches the handle to ExpandWorldData.BiomeManager's BiomeToTerrain
         * dictionary for high-relief discovery later.
         *
-        * 1.0.1 bug fix: we used to look for a field named "WorldRadius" which has
+        * 1.0.1 bug fix: I  used to look for a field named "WorldRadius" which has
         * never existed on EWD's WorldInfo. Detection has therefore been silently
         * failing since the day EWD support was added. The real field is "Radius".
+        * Either Jere changed it, or I was blind. 
         */
         private static void DetectExpandWorldData(ManualLogSource loggerP)
         {
