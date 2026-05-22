@@ -1,9 +1,11 @@
-// v1
+// v1.1
 /**
-* Facade over the active BucketingStrategy.
+* The facade over the active BucketingStrategy.
 * All survey and candidate-list access from the placement engines
 * goes through here so the strategy implementation can be swapped
 * without touching callers.
+*
+* 1.1: ClearAllCaches passthrough for the LPA public API.
 */
 #nullable disable
 using System;
@@ -48,6 +50,12 @@ namespace LPA
         public static void ClearCache(string prefabNameP)
         {
             _activeStrategy?.ClearCache(prefabNameP);
+            SurveyExhausted = false;
+        }
+
+        public static void ClearAllCaches()
+        {
+            _activeStrategy?.ClearAllCaches();
             SurveyExhausted = false;
         }
 

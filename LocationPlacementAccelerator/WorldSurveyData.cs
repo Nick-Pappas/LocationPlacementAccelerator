@@ -1,4 +1,4 @@
-// v1.0.2
+// v1.0.4
 /**
 * Pre-scans the entire world grid in parallel, building a flat ZoneProfile[]
 * array with packed biome/area/distance bitmasks per zone. Also performs
@@ -22,6 +22,13 @@
 * set bit 31 (e.g. 0x80000000 from NextBiome wraparound). Casting (long)(int)Biome
 * on such a value sign-extends and corrupts bits 32..63 in the resulting long,
 * colliding with the synthetic flags.
+*
+* 1.0.3c: Exposed IsInitialized so the LPA public API path can lazy-init the
+* survey on the first API call after a session start without paying the cost
+* on every subsequent call.
+*
+* 1.0.4: OccupiedZoneIndices switched from HashSet to ConcurrentDictionary.
+* Not sure this will fix ashenius's problem but it is the correct move regardless. 
 */
 #nullable disable
 using System;
@@ -49,11 +56,17 @@ namespace LPA
 
         public static ZoneProfile[] Grid { get; private set; }
         public static Dictionary<Vector2i, int> ZoneToIndex { get; private set; } = new Dictionary<Vector2i, int>();
-        public static HashSet<int> OccupiedZoneIndices { get; private set; } = new HashSet<int>();
+        public static System.Collections.Concurrent.ConcurrentDictionary<int, byte> OccupiedZoneIndices { get; private set; }
+            = new System.Collections.Concurrent.ConcurrentDictionary<int, byte>();
 
         private static bool _initialized = false;
         private static int _scanRowsDone = 0;
         private static int _scanTotalRows = 0;
+
+        public static bool IsInitialized
+        {
+            get { return _initialized; }
+        }
 
         public static float SurveyProgress
         {
@@ -141,9 +154,8 @@ namespace LPA
 
                     // AshLands zones below sea level are reclassified as BiomeBoilingOcean so they match
                     // AshLands underwater location types during candidate scan.
-                    // NOTE: this remains a vanilla-geometry-specific hack. A custom "lava" biome whose
-                    // terrain dips below sea level would NOT be reclassified here. Acceptable for now
-                    // because this only matters for the handful of AshLands sub-sea location types.
+                    // NOTE: this remains a vanilla-geometry-specific hack. A custom "lava" biome whose terrain dips below sea level would NOT be reclassified here.
+                    // Acceptable for now because this only matters for the handful of AshLands sub-sea location types. Or was it just one? I do not recall anymore. Need better notes, and note random comments here and there. 
                     bool isAshLands = (bMask & (long)Heightmap.Biome.AshLands) != 0L;
                     if (isAshLands && normH < -4.0f)
                     {
@@ -286,9 +298,7 @@ namespace LPA
             {
                 for (int oz = 0; oz < gridSizeP; oz++)
                 {
-                    // (uint) cast first to prevent sign extension when biome bit 31 is set
-                    // (EWD's NextBiome can produce 0x80000000). (long)(int) would sign-extend
-                    // and corrupt bits 32..63 in the mask, colliding with our synthetic flags.
+                    // (uint) cast first to prevent sign extension when biome bit 31 is set (EWD's NextBiome can produce 0x80000000). (long)(int) would sign-extend and corrupt bits 32..63 in the mask, colliding with our synthetic flags.
                     mask |= (long)(uint)(int)WorldGenerator.instance.GetBiome(new Vector3(zoneCenterP.x + offsetsP[ox], 0, zoneCenterP.z + offsetsP[oz]));
                 }
             }
@@ -386,7 +396,7 @@ namespace LPA
                 }
                 catch
                 {
-                    // Fall through to vanilla name map.
+                    // Fall through to vanilla name map. 
                 }
             }
 

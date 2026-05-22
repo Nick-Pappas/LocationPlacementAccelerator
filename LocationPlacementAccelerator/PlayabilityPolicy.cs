@@ -1,4 +1,4 @@
-// v4
+// v5
 /**
 * Defines which location types are vital for a playable world and their
 * minimum placement thresholds. Pure data + pure functions - no state.
@@ -22,6 +22,9 @@
 * alongside _yamlOverrides so config reloads pick up cleanly.
 *
 * v4: Gate YAML loading on EWD actually being present. 
+*
+* v5: _resolvedCache switched from Dictionary to ConcurrentDictionary.
+* For ashenius' reported probelm
 */
 #nullable disable
 using System.Collections.Generic;
@@ -64,7 +67,8 @@ namespace LPA
 
         private static Dictionary<string, LocationYamlOverride> _yamlOverrides = new Dictionary<string, LocationYamlOverride>(System.StringComparer.Ordinal);
 
-        private static Dictionary<string, EffectivePolicy> _resolvedCache = new Dictionary<string, EffectivePolicy>(System.StringComparer.Ordinal);
+        private static System.Collections.Concurrent.ConcurrentDictionary<string, EffectivePolicy> _resolvedCache
+            = new System.Collections.Concurrent.ConcurrentDictionary<string, EffectivePolicy>(System.StringComparer.Ordinal);
 
 
         public static void Initialize()

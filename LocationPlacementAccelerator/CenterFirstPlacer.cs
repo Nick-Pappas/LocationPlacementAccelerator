@@ -1,4 +1,4 @@
-// v3
+// v3.1
 /**
 * Sequential placer for m_centerFirst locations (e.g. StartTemple / spawning altar).
 *
@@ -34,6 +34,10 @@
 * v3: Swapped the strict m_prefab.IsValid pre-check for Compatibility.IsValidLocation.
 * If someone ever marks a blueprint location m_centerFirst (EWD lets them) the old
 * check would silently skip it. Matches Core / Parallel / GenerationProgress now.
+*
+* v3.1: API path filter. When ApiState.IsApiRun is true, only the
+* prefabs named in the request list participate and all other entries in
+* zsP.m_locations are skipped.
 */
 #nullable disable
 using System.Collections.Generic;
@@ -51,6 +55,19 @@ namespace LPA
         {
             List<string> placed = new List<string>();
 
+            HashSet<string> apiPrefabFilter = null;
+            if (ApiState.IsApiRun && ApiState.Requests != null)
+            {
+                apiPrefabFilter = new HashSet<string>(System.StringComparer.Ordinal);
+                foreach (PlacementRequest req in ApiState.Requests)
+                {
+                    if (req.Location != null)
+                    {
+                        apiPrefabFilter.Add(req.Location.m_prefabName);
+                    }
+                }
+            }
+
             foreach (ZoneLocation loc in zsP.m_locations)
             {
                 if (!loc.m_enable)
@@ -58,6 +75,10 @@ namespace LPA
                     continue;
                 }
                 if (!loc.m_centerFirst)
+                {
+                    continue;
+                }
+                if (apiPrefabFilter != null && !apiPrefabFilter.Contains(loc.m_prefabName))
                 {
                     continue;
                 }
@@ -212,7 +233,7 @@ namespace LPA
                     bool hasZoneIndex = WorldSurveyData.ZoneToIndex.TryGetValue(zoneID, out int zIdx);
                     if (hasZoneIndex)
                     {
-                        WorldSurveyData.OccupiedZoneIndices.Add(zIdx);
+                        WorldSurveyData.OccupiedZoneIndices.TryAdd(zIdx, 0);
                         SurveyMode.MarkZoneOccupied(zIdx);
                     }
 

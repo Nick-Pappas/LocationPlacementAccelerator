@@ -1,4 +1,4 @@
-// v1
+// v1.2
 /**
 * Abstract base for all zone bucketing strategies.
 * Defines the contract that SurveyMode delegates through: zone retrieval,
@@ -6,6 +6,14 @@
 * Concrete implementations (for now): LocationTypeBucketingStrategy.
 * Biome bucketing which I think will perform better I leave for later.
 * Obviously the hybrid will be done after I do the biome properly.
+*
+* 1.1c: ClearAllCaches() added as a virtual no-op so the LPA public API
+* can wipe per-prefab candidate caches between calls (the AllowedZones
+* filter bakes into the cache; different masks on consecutive calls
+* would otherwise see corrupted lists).
+*
+* 1.2: MarkZoneOccupied default uses TryAdd to match OccupiedZoneIndices
+* now being a ConcurrentDictionary (see WorldSurveyData v1.0.4).
 */
 #nullable disable
 using System;
@@ -36,15 +44,16 @@ namespace LPA
             {
                 return;
             }
-            WorldSurveyData.OccupiedZoneIndices.Add(zoneIndexP);
+            WorldSurveyData.OccupiedZoneIndices.TryAdd(zoneIndexP, 0);
         }
 
         public abstract void PruneZone(string prefabNameP, Vector2i zoneIdP);
         public abstract void ClearCache(string prefabNameP);
+        public virtual void ClearAllCaches() { }
         public abstract void DumpDiagnostics();
         public abstract List<Vector2i> GetOrBuildCandidateList(ZoneSystem.ZoneLocation locationP);
 
-        
+
         protected static void Shuffle<T>(List<T> listP)
         {
             int n = listP.Count;

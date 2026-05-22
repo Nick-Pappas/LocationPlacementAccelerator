@@ -1,4 +1,4 @@
-// v1.0.3
+// v1.0.5
 
 /**
 * Smart recovery system for vital location types. When a critical type
@@ -23,6 +23,21 @@
 * 1.0.3: Distance relaxation now clamps m_maxDistance to ModConfig.WorldRadius so 
 * I do not pretend to relax to a value beyond the actual playable disk. The min 
 * distance side already clamped to 0; max side now mirrors that with WorldRadius.
+*
+* 1.0.4c: Added RestoreAllStats() for the LPA public API path. The existing
+* RestoreQuantities only puts m_quantity back; it leaves the relaxed
+* altitude/distance/terrain/exteriorRadius values mutated on the ZoneLocations
+* in ZoneSystem.m_locations. World-gen tolerates this because the stats are
+* not read after EndGeneration. The API path needs a clean rollback though
+* or sequential calls see "relaxed" constraints from earlier calls. This
+* function takes the OriginalStats snapshot and restores every field. World-gen
+* is unchanged - it still only calls RestoreQuantities.
+*
+* 1.0.5: RelaxationAttempts and _originalStats switched to ConcurrentDictionary.
+* TryRelax (worker thread) writes both before the attempts >= maxAttempts gate,
+* so even MaxRelaxationAttempts = 0 triggers concurrent writes when multiple
+* prefabs fail at the same moment. Same crash class as the OccupiedZoneIndices
+* HashSet race, non-thread-safe collection mutated from parallel workers.
 */
 #nullable disable
 using System;
@@ -41,8 +56,10 @@ namespace LPA
             public int Quantity;
         }
 
-        public static Dictionary<string, int> RelaxationAttempts = new Dictionary<string, int>();
-        private static Dictionary<string, OriginalStats> _originalStats = new Dictionary<string, OriginalStats>();
+        public static System.Collections.Concurrent.ConcurrentDictionary<string, int> RelaxationAttempts
+            = new System.Collections.Concurrent.ConcurrentDictionary<string, int>(System.StringComparer.Ordinal);
+        private static System.Collections.Concurrent.ConcurrentDictionary<string, OriginalStats> _originalStats
+            = new System.Collections.Concurrent.ConcurrentDictionary<string, OriginalStats>(System.StringComparer.Ordinal);
         public static object CapturedOuterLoop = null;
 
         public static void CaptureStateMachine(object smP)
@@ -84,6 +101,51 @@ namespace LPA
                     {
                         DiagnosticLog.WriteLog($"[Adjuster] Restored {kvp.Key} m_quantity to {kvp.Value.Quantity}.");
                     }
+                }
+            }
+        }
+
+        /**
+        * Full rollback for the LPA public API path. Where RestoreQuantities
+        * only puts m_quantity back, this restores every relaxed field on the
+        * matching ZoneLocation in ZoneSystem.m_locations (altitude bounds,
+        * distance bounds, terrain delta bounds, exterior radius). The
+        * snapshot was taken on first relaxation in TryRelax / EnsureSnapshot
+        * (whichever fires first), so this is a no-op when nothing was
+        * relaxed during the call. Called from LPA.API.RunCustomPlacement's
+        * finally so consecutive API calls start each with the original
+        * world-defined constraints.
+        */
+        public static void RestoreAllStats()
+        {
+            ZoneSystem zs = ZoneSystem.instance;
+            if (zs == null || _originalStats.Count == 0)
+            {
+                return;
+            }
+
+            foreach (KeyValuePair<string, OriginalStats> kvp in _originalStats)
+            {
+                OriginalStats orig = kvp.Value;
+                for (int i = 0; i < zs.m_locations.Count; i++)
+                {
+                    ZoneLocation loc = zs.m_locations[i];
+                    if (loc.m_prefabName != kvp.Key)
+                    {
+                        continue;
+                    }
+                    loc.m_minAltitude = orig.MinAlt;
+                    loc.m_maxAltitude = orig.MaxAlt;
+                    loc.m_minDistance = orig.MinDist;
+                    loc.m_maxDistance = orig.MaxDist;
+                    loc.m_minTerrainDelta = orig.MinTerr;
+                    loc.m_maxTerrainDelta = orig.MaxTerr;
+                    loc.m_exteriorRadius = orig.ExtRad;
+                    loc.m_quantity = orig.Quantity;
+                }
+                if (ModConfig.DiagnosticMode.Value)
+                {
+                    DiagnosticLog.WriteLog($"[Adjuster] API restored all stats for {kvp.Key}.");
                 }
             }
         }

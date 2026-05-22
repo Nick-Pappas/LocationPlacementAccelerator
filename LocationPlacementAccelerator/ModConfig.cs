@@ -1,9 +1,23 @@
-// v1.1c
+// v1.2
 /**
 * Static configuration holder for Location Placement Accelerator.
 * All config entries, effective runtime values, and shared mod state live here.
 * Initialized once from LPAPlugin.Awake() via Initialize().
 * EASILY the most annoying and time consuming part of the mod to implement.
+*
+* 1.2: Fixed the silent coercion bug in the Effective* derivation. The old
+* Rule 1 unconditionally forced Survey + replaced engine whenever
+* EnableParallelPlacement was true (which is the default), so users who
+* picked Mode=Vanilla/Filter/Force but left parallel enabled got silently
+* dragged back to Survey + replaced engine - Rule 4 (Vanilla forces
+* legacy) evaluated against the already-overwritten Mode and never fired.
+* Rewrote as two rules with explicit ordering: (1) Vanilla/Filter/Force
+* always force the transpiled engine, (2) Parallel forces the replaced
+* engine ONLY when Mode is Survey. The user's explicit Mode choice now
+* wins.
+* Parallel becomes a no-op (logged) when Mode is incompatible.
+* 
+* This becomes  confusing maybe I should just simplify it or make presets like in BC, and that is that.
 */
 #nullable disable
 using BepInEx.Configuration;
@@ -308,36 +322,44 @@ namespace LPA
             }
 
             /**
-            * Applied top-down. Higher rules override lower ones with no conflicts possible.
-            * Results written to EffectiveMode and EffectiveLegacy.
-            * The log file configuration header shows what actually ran.
+            * Coercion rules. Order matters - rules are applied top-down.
+            *
+            * Starting values come from the user's config. From there:
+            *
+            * Rule 1: Vanilla, Filter, and Force are non-Survey modes that
+            * only the transpiled (legacy) engine supports. If the user
+            * picks one of these, force EffectiveLegacy = true regardless
+            * of what UseLegacyEngine.Value says. Parallel placement is
+            * not available in these modes; it becomes a no-op (logged).
+            *
+            * Rule 2: Parallel placement is implemented in the replaced
+            * engine, which only supports Survey mode. If the user picked
+            * Survey AND enabled parallel, force EffectiveLegacy = false
+            * (the replaced engine). This overrides an explicit
+            * UseLegacyEngine = true in the Survey case, on the assumption
+            * that enabling parallel is the stronger signal of intent.
             */
             EffectiveMode = Mode.Value;
             EffectiveLegacy = UseLegacyEngine.Value;
 
-            // Rule 1: Parallel placement forces Survey + replaced engine (highest priority).
-            if (EnableParallelPlacement.Value)
+            // Rule 1.
+            if (EffectiveMode == PlacementMode.Vanilla
+                || EffectiveMode == PlacementMode.Filter
+                || EffectiveMode == PlacementMode.Force)
             {
-                EffectiveMode = PlacementMode.Survey;
+                EffectiveLegacy = true;
+                if (EnableParallelPlacement.Value)
+                {
+                    Log.LogWarning(
+                        $"[LPA] EnableParallelPlacement is on but Mode is {Mode.Value}; " +
+                        "parallel placement only runs in Survey mode and will be ignored.");
+                }
+            }
+
+            // Rule 2.
+            if (EnableParallelPlacement.Value && EffectiveMode == PlacementMode.Survey)
+            {
                 EffectiveLegacy = false;
-            }
-
-            // Rule 2: Replaced engine requires Survey mode.
-            if (!EffectiveLegacy && EffectiveMode != PlacementMode.Survey)
-            {
-                EffectiveMode = PlacementMode.Survey;
-            }
-
-            // Rule 3: Filter and Force require the transpiled engine.
-            if (EffectiveMode == PlacementMode.Filter || EffectiveMode == PlacementMode.Force)
-            {
-                EffectiveLegacy = true;
-            }
-
-            // Rule 4: Vanilla requires the transpiled engine.
-            if (EffectiveMode == PlacementMode.Vanilla)
-            {
-                EffectiveLegacy = true;
             }
         }
     }

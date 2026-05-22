@@ -1,4 +1,4 @@
-// v1.0.4
+// v1.0.5
 /**
 * Core of the replaced placement engine. This partial class contains:
 *  Run(): the entry-point coroutine called by ReplacedEnginePatches
@@ -40,6 +40,8 @@
 * story. The m_enable / m_quantity portions of each filter are kept inline because
 * the two sites have slightly different needs (partitions build doesn't gate on
 * quantity, token-list build does).
+*
+* 1.0.5: Public API plumbing.
 */
 #nullable disable
 using System;
@@ -86,10 +88,10 @@ namespace LPA
         // without iterating m_locationInstances (which is being mutated on main thread).
         private static Dictionary<string, int> _centerFirstCounts;
 
-        // Private setter for ZoneSystem.LocationsGenerated - must be set to true at the end of placement or the game hangs on a black screen.
+        // Private setter for ZoneSystem.LocationsGenerated - must be set to true at the end of placement or the game hangs on a black screen. :s
         private static PropertyInfo _locationsGeneratedProp;
 
-        // ZoneSystem.m_generateLocationsProgress - drives the vanilla LoadingIndicator annulus so it tracks the placement progress.
+        // ZoneSystem.m_generateLocationsProgress - drives the vanilla LoadingIndicator annulus so it tracks the placement progress. 
         private static FieldInfo _generateLocationsProgressField;
 
         /**
@@ -126,21 +128,23 @@ namespace LPA
                 }
             }
 
-            float outerMult = ModConfig.OuterMultiplier.Value;
-            float innerMult = ModConfig.InnerMultiplier.Value;
+            float outerMult = ApiState.Options?.OuterMultiplier ?? ModConfig.OuterMultiplier.Value;
+            float innerMult = ApiState.Options?.InnerMultiplier ?? ModConfig.InnerMultiplier.Value;
             _outerBudgetBase = Mathf.Max(1, Mathf.RoundToInt(100000 * outerMult));//100k is the vanilla for non prioritized
             _outerBudgetPrioritized = Mathf.Max(1, Mathf.RoundToInt(200000 * outerMult));//200k for the prioritized.
-            _dartsPerZone = Mathf.Max(1, Mathf.RoundToInt(20 * innerMult)); //vanilla inner loop is 20 darts per zone. I feel I keep repeating these numbers in every other file...
-            _maxRelaxationAttempts = ModConfig.MaxRelaxationAttempts.Value;
-            _interleavedScheduling = ModConfig.EnableInterleavedScheduling.Value;
-            _minimalLogging = ModConfig.MinimalLogging.Value;
-            _logSuccesses = ModConfig.LogSuccesses.Value;
+            _dartsPerZone = Mathf.Max(1, Mathf.RoundToInt(20 * innerMult)); //vanilla inner loop is 20 darts per zone. I feel I keep repeating these numbers in every other file... I should throw them in some constants. This is ridiculous.
+            _maxRelaxationAttempts = ApiState.Options?.MaxRelaxationAttempts ?? ModConfig.MaxRelaxationAttempts.Value;
+            _interleavedScheduling = ApiState.Options?.Interleaved ?? ModConfig.EnableInterleavedScheduling.Value;
+            _minimalLogging = ApiState.Options?.MinimalLogging ?? ModConfig.MinimalLogging.Value;
+            _logSuccesses = ApiState.Options?.LogSuccesses ?? ModConfig.LogSuccesses.Value;
             _mode = ModConfig.EffectiveMode;
-            _enable3DSimilarity = ModConfig.Enable3DSimilarityCheck.Value;
+            _enable3DSimilarity = ApiState.Options?.Enable3DSimilarityCheck ?? ModConfig.Enable3DSimilarityCheck.Value;
             _highReliefBiomeMask = Compatibility.GetHighReliefBiomeMask();
 
-            _parallelPlacement = ModConfig.EnableParallelPlacement.Value
-                && _mode == PlacementMode.Survey;
+            // API mode always uses the Survey-pipeline (only path that supports
+            // parallel placement and the bucketing/candidate cache).
+            bool parallelDefault = ApiState.Options?.Parallel ?? ModConfig.EnableParallelPlacement.Value;
+            _parallelPlacement = parallelDefault && (ApiState.IsApiRun || _mode == PlacementMode.Survey);
             if (_parallelPlacement)
             {
                 int raw = System.Environment.ProcessorCount - 2;
@@ -163,25 +167,42 @@ namespace LPA
             * vanilla outer coroutine via the ReplacedEnginePatches prefix, so I have
             * to do this myself or genloc-on-saved-world inherits every old reservation
             * as a hard occupancy claim and starves modded locations in scarce biomes.
+            *
+            * API mode skips this. UW already swept its own targets selectively (only
+            * the prefabs it is acting on, preserving everyone else's unplaced
+            * reservations). Pruning here would destroy state UW kept on purpose.
             */
-            int beforeCount = zsP.m_locationInstances.Count;
-            Dictionary<Vector2i, LocationInstance> retained = new Dictionary<Vector2i, LocationInstance>();
-            foreach (KeyValuePair<Vector2i, LocationInstance> kvp in zsP.m_locationInstances)
+            if (!ApiState.IsApiRun)
             {
-                if (kvp.Value.m_placed)
+                int beforeCount = zsP.m_locationInstances.Count;
+                Dictionary<Vector2i, LocationInstance> retained = new Dictionary<Vector2i, LocationInstance>();
+                foreach (KeyValuePair<Vector2i, LocationInstance> kvp in zsP.m_locationInstances)
                 {
-                    retained.Add(kvp.Key, kvp.Value);
+                    if (kvp.Value.m_placed)
+                    {
+                        retained.Add(kvp.Key, kvp.Value);
+                    }
+                }
+                zsP.m_locationInstances = retained;
+                int sweptCount = beforeCount - retained.Count;
+                if (sweptCount > 0)
+                {
+                    DiagnosticLog.WriteTimestampedLog(
+                        $"[LPA] Cleared {sweptCount} non-placed location reservations. Kept {retained.Count} placed instances.");
                 }
             }
-            zsP.m_locationInstances = retained;
-            int sweptCount = beforeCount - retained.Count;
-            if (sweptCount > 0)
-            {
-                DiagnosticLog.WriteTimestampedLog(
-                    $"[LPA] Cleared {sweptCount} non-placed location reservations. Kept {retained.Count} placed instances.");
-            }
 
-            Interleaver.InterleaveLocations(zsP);
+            // Interleaver path. World-gen mutates zsP.m_locations directly; API
+            // mode goes through BuildApiWorkList which returns a private list
+            // and never touches zsP.m_locations.
+            if (ApiState.IsApiRun)
+            {
+                ApiState.WorkList = Interleaver.BuildApiWorkList(ApiState.Requests, _interleavedScheduling);
+            }
+            else
+            {
+                Interleaver.InterleaveLocations(zsP);
+            }
             GenerationProgress.StartGeneration(zsP);
 
             if (MinimapParallelizer.DeferredTimingMessage != null)
@@ -192,31 +213,38 @@ namespace LPA
             GenerationProgress.MarkActualStartNoSurvey();
 
             // Run survey off the main thread so OnGUI can render the progress overlay.
-            if (ModConfig.EffectiveMode == PlacementMode.Survey)
+            // API mode also needs the survey, even if the world-gen mode was Vanilla
+            // (the replaced engine's parallel/sequential paths both require it).
+            // Lazy-init: if a prior world-gen or API call already ran the survey,
+            // we skip the rescan and proceed straight to SurveyMode init.
+            bool needsSurvey = ApiState.IsApiRun || ModConfig.EffectiveMode == PlacementMode.Survey;
+            if (needsSurvey)
             {
-                GenerationProgress.BeginSurvey();
-                Task surveyTask = Task.Run(() => WorldSurveyData.Initialize());
-                while (!surveyTask.IsCompleted)
+                if (!WorldSurveyData.IsInitialized)
                 {
+                    GenerationProgress.BeginSurvey();
+                    Task surveyTask = Task.Run(() => WorldSurveyData.Initialize());
+                    while (!surveyTask.IsCompleted)
+                    {
+                        yield return null;
+                    }
+                    if (surveyTask.IsFaulted)
+                    {
+                        Exception inner = surveyTask.Exception.InnerException;
+                        if (inner != null)
+                        {
+                            throw inner;
+                        }
+                        throw surveyTask.Exception;
+                    }
+                    GenerationProgress.EndSurvey();
                     yield return null;
                 }
-                if (surveyTask.IsFaulted)
-                {
-                    Exception inner = surveyTask.Exception.InnerException;
-                    if (inner != null)
-                    {
-                        throw inner;
-                    }
-                    throw surveyTask.Exception;
-                }
                 SurveyMode.Initialize();
-                GenerationProgress.EndSurvey();
                 yield return null;
             }
 
-            yield return null;
-
-            PresenceGrid.Initialize(ModConfig.PresenceGridCellSize.Value);
+            PresenceGrid.Initialize(ApiState.Options?.PresenceGridCellSize ?? ModConfig.PresenceGridCellSize.Value);
 
             _groupPartitions = new Dictionary<string, HashSet<float>>(StringComparer.Ordinal);
             foreach (ZoneLocation loc in zsP.m_locations)
@@ -614,21 +642,30 @@ namespace LPA
         {
             List<PlacementToken> tokens = new List<PlacementToken>();
 
-            HashSet<string> centerFirstNames = new HashSet<string>();
-            for (int i = 0; i < zsP.m_locations.Count; i++)
+            // API mode iterates the per-call work list (clones with TargetQuantity
+            // already stamped over m_quantity, optionally packetized). World-gen
+            // iterates zsP.m_locations as before.
+            List<ZoneLocation> source = zsP.m_locations;
+            if (ApiState.IsApiRun && ApiState.WorkList != null)
             {
-                if (zsP.m_locations[i].m_centerFirst)
+                source = ApiState.WorkList;
+            }
+
+            HashSet<string> centerFirstNames = new HashSet<string>();
+            for (int i = 0; i < source.Count; i++)
+            {
+                if (source[i].m_centerFirst)
                 {
-                    centerFirstNames.Add(zsP.m_locations[i].m_prefabName);
+                    centerFirstNames.Add(source[i].m_prefabName);
                 }
             }
 
             // Build and sort the eligible location list.
             // Priority sort must be stable - vanilla uses OrderByDescending(m_prioritized).
             List<ZoneLocation> eligible = new List<ZoneLocation>();
-            for (int i = 0; i < zsP.m_locations.Count; i++)
+            for (int i = 0; i < source.Count; i++)
             {
-                ZoneLocation loc = zsP.m_locations[i];
+                ZoneLocation loc = source[i];
                 // EWD-mirror: accept blueprints (empty AssetID, name-only SoftReference)
                 // so they actually make it into the token list. Quantity check stays inline.
                 if (loc.m_enable && Compatibility.IsValidLocation(loc) && loc.m_quantity > 0)

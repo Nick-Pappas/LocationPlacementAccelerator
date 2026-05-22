@@ -1,4 +1,4 @@
-// v1.0.5
+// v1.0.6
 /**
 * Replaces vanilla's single-threaded Minimap.GenerateWorldMap() with a
 * parallel implementation. Intercepts the Minimap.Update() loop via a
@@ -31,6 +31,28 @@
 * invocation stays. If the EWS-regen bug ever needs re-investigation, I can pull the diagnostic 
 * from a 1.0.4-tagged git revision; reinventing it from scratch would be a PIA. 
 * I do not remember if I fixed the EWS regen... I need to look. 
+*
+* 1.0.6  16k map support. The original _heights as Color[] could not survive 
+* the multiplier-8 case: 16384*16384*16 bytes = 4.29 GB single object, instantly 
+* OOM under the CLR's 2 GB single-object ceiling. Replaced with a ushort[] half-
+* float buffer encoded directly via Mathf.FloatToHalf, uploaded via the native 
+* SetPixelData<ushort> path. The runtime height texture is RHalf (16-bit single-
+* channel float) so this is the canonical zero-conversion upload.  I hand Unity 
+* the exact bits it would have produced internally from a Color[] anyway. Memory 
+* drops from 4.29 GB to 256 MB for that buffer at 16k, and the upload is one 
+* native call instead of an internal per-pixel float-to-half conversion across 
+* the whole array.
+*
+* Also closed an exception-safety hole in Prefix: previously _started was set 
+* AFTER LaunchGeneration returned, so if LaunchGeneration threw (e.g. the original 
+* OOM at 16k) the next Minimap.Update tick re-entered the same branch and re-threw, 
+* spamming the log with infinitely repeating stack traces. _started is now set 
+* before the call so a single failure stops the cycle.
+*
+* The disk-save path is unchanged - _heightPacked stays as Color32[] in vanilla's 
+* (R<<8 + G)/127.5 encoding, written to a temporary RGBA32 texture for the PNG 
+* round-trip. Anything that touches the on-disk format stays bit-identical to 
+* vanilla so saved-world cache loads keep working.
 */
 #nullable disable
 using System;
@@ -52,7 +74,7 @@ namespace LPA
 
         private static Color32[] _mapColors;
         private static Color32[] _maskColors;
-        private static Color[] _heights;
+        private static ushort[] _heightHalf;
         private static Color32[] _heightPacked;
 
         private static volatile int _rowsDone;
@@ -131,7 +153,7 @@ namespace LPA
 
             _mapColors = null;
             _maskColors = null;
-            _heights = null;
+            _heightHalf = null;
             _heightPacked = null;
 
             _rowsDone = 0;
@@ -172,9 +194,24 @@ namespace LPA
 
             if (!_started)
             {
-                LaunchGeneration(__instance);
+                // Set _started BEFORE the call. If LaunchGeneration throws (allocation 
+                // failure, etc.) we want the next Update tick to fall through to the 
+                // _task null-check below and log a single failure, not re-enter this 
+                // branch and re-throw forever.
                 _started = true;
+                LaunchGeneration(__instance);
                 return false;
+            }
+
+            if (_task == null)
+            {
+                // LaunchGeneration threw before _task was assigned. One log line, then 
+                // wedged in this state until Reset() is called via game logout. Better 
+                // than infinite re-throw.
+                ModConfig.Log.LogError("[LPA] Minimap generation failed during launch; aborting parallel path. Falling back to vanilla on next world load.");
+                _started = false;
+                _cacheChecked = false;
+                return true;
             }
 
             if (!_task.IsCompleted)
@@ -206,7 +243,7 @@ namespace LPA
             _task = null;
             _mapColors = null;
             _maskColors = null;
-            _heights = null;
+            _heightHalf = null;
             _heightPacked = null;
 
             return false;
@@ -229,7 +266,7 @@ namespace LPA
 
             _mapColors = new Color32[totalPixels];
             _maskColors = new Color32[totalPixels];
-            _heights = new Color[totalPixels];
+            _heightHalf = new ushort[totalPixels];
             _heightPacked = new Color32[totalPixels];
 
             Dictionary<Heightmap.Biome, Color32> biomeColorMap = BuildBiomeColorMap(instanceP);
@@ -281,15 +318,14 @@ namespace LPA
                         }
 
                         _maskColors[idx] = ComputeMaskColor(wx, wy, biomeHeight, terrainBiome);
-                        _heights[idx].r = biomeHeight;
 
-                        // 1.0.7c - match vanilla's GenerateWorldMap line 1392-1395 
-                        // exactly. Earlier code used *65.535 with clamp at height=1000; 
-                        // vanilla expects *127.5 with clamp at packed=65025 (i.e. 
-                        // height ~510m). Vanilla's TryLoadMinimapTextureData unpacks 
-                        // with /127.5, so any mismatch in the multiplier corrupts the 
-                        // height on the next saved-world load. See header docblock 
-                        // for full rationale.
+                        // encode the float biomeHeight directly as IEEE 754 half precision. This is what Unity does internally when SetPixels(Color[]) 
+                        // uploads to an RHalf texture, just done here in parallel instead of on the main thread during Apply(). Bit-identical result hopefully.
+                        _heightHalf[idx] = Mathf.FloatToHalf(biomeHeight);
+
+                        // match vanilla's GenerateWorldMap line 1392-1395 exactly. Earlier code used *65.535 with clamp at height=1000 vanilla expects *127.5 with clamp at packed=65025
+                        // (i.e.height ~510m). Vanilla's TryLoadMinimapTextureData unpacks with /127.5, so any mismatch in the multiplier corrupts the height on the next saved-world load.
+                        // See header docblock for full rationale if I forget the situation. 
                         int packed = Mathf.Clamp((int)(biomeHeight * 127.5f), 0, 65025);
                         _heightPacked[idx] = new Color32((byte)(packed >> 8), (byte)(packed & 255), 0, byte.MaxValue);
                     }
@@ -304,7 +340,8 @@ namespace LPA
             _forestMaskTexture(instanceP).Apply();
             _mapTexture(instanceP).SetPixels32(_mapColors);
             _mapTexture(instanceP).Apply();
-            _heightTexture(instanceP).SetPixels(_heights);
+
+            _heightTexture(instanceP).SetPixelData(_heightHalf, 0);
             _heightTexture(instanceP).Apply();
 
             Texture2D packedTex = new Texture2D(instanceP.m_textureSize, instanceP.m_textureSize);

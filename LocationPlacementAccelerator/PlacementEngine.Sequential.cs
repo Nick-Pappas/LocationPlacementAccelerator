@@ -1,4 +1,4 @@
-// v1
+// v1.2
 /**
 * Sequential (single-threaded) placement path for the replaced engine.
 *
@@ -18,6 +18,13 @@
 * appended packets.
 * 
 * The third part of the god class in a row, but I need those picoseconds.
+*
+* 1.1: API gates at the bottom for LocationsGenerated.
+* 1.2: Pass ApiState.IsApiRun straight through to EndGeneration. The
+* world-gen-only cleanups (m_locations restore, full surveyor reset,
+* relax-quantity restore) are  inside EndGeneration itself.
+* The * overlay teardown and summary log run in both paths now and 
+* I am not left with the GUI staring at me.
 */
 #nullable disable
 using System;
@@ -112,10 +119,10 @@ namespace LPA
                     group = loc.m_group;
                 }
                 PresenceGrid groupGrid = PresenceGrid.GetOrCreate($"{group}:{loc.m_minDistanceFromSimilar:F0}");
-                int baseBudget = 100000; 
+                int baseBudget = 100000;
                 if (loc.m_prioritized)
                 {
-                    baseBudget = 200000; 
+                    baseBudget = 200000;
                 }
                 int outerBudget = Interleaver.GetBudget(loc, baseBudget);
 
@@ -366,22 +373,25 @@ namespace LPA
                 }
             }
 
-            if (_locationsGeneratedProp != null)
+            if (!ApiState.IsApiRun)
             {
-                _locationsGeneratedProp.SetValue(zsP, true);
-            }
-            else
-            {
-                DiagnosticLog.WriteLog(
-                    "[LPA] WARNING: Could not set LocationsGenerated via reflection. Black screen likely.",
-                    BepInEx.Logging.LogLevel.Error);
+                if (_locationsGeneratedProp != null)
+                {
+                    _locationsGeneratedProp.SetValue(zsP, true);
+                }
+                else
+                {
+                    DiagnosticLog.WriteLog(
+                        "[LPA] WARNING: Could not set LocationsGenerated via reflection. Black screen likely.",
+                        BepInEx.Logging.LogLevel.Error);
+                }
             }
 
             SurveyMode.DumpDiagnostics();
             DiagnosticLog.DumpPlacementsToFile();
             GenerationProgress.CurrentLocation = null;
             RelaxationTracker.MarkPlacementComplete();
-            GenerationProgress.EndGeneration();
+            GenerationProgress.EndGeneration(ApiState.IsApiRun);
         } // Probably beaten the max quasi bicliques record in absurd method length here ffs. Maybe I should rethink these colossal methods. 
 
         /**

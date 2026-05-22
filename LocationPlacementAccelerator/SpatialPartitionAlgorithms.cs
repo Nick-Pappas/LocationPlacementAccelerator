@@ -239,45 +239,5 @@ namespace LPA
             }
             return remainder;
         }
-    
-
-        // Named structs instead of tuples so the sort comparators and loop bodies have readable field names.
-        private struct ZoneAngle
-        {
-            public Vector2i Zone;
-            public float Angle;
-        }
-
-        private struct AngularGap
-        {
-            public int AfterIndex;
-            public float GapSize;
-        }
-
-        private static int CompareByAngle(ZoneAngle aP, ZoneAngle bP)
-        {
-            if (aP.Angle < bP.Angle)
-            {
-                return -1;
-            }
-            if (aP.Angle > bP.Angle)
-            {
-                return 1;
-            }
-            return 0;
-        }
-
-        private static int CompareByGapSizeDescending(AngularGap aP, AngularGap bP)
-        {
-            if (bP.GapSize < aP.GapSize)
-            {
-                return -1;
-            }
-            if (bP.GapSize > aP.GapSize)
-            {
-                return 1;
-            }
-            return 0;
-        }
     }
 }

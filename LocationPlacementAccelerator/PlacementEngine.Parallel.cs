@@ -1,4 +1,4 @@
-// v1.0.4
+// v1.0.7
 /**
 * Multi-threaded placement path for the replacement engine.
 *
@@ -11,6 +11,17 @@
 * ordered-list build to Compatibility.IsValidLocation so EWD blueprint locations 
 * make it into the work queue. Same root cause as Core's 1.0.4; see Compatibility.cs
 * v1.0.2 header for the full story.
+*
+* 1.0.5: API gates for LocationsGenerated.
+* 1.0.6: Pass ApiState.IsApiRun through to EndGeneration so the overlay
+* tears down on API completion. World-gen-only cleanups stay gated inside
+* EndGeneration.
+* 1.0.7: Worker fault rethrow now uses ExceptionDispatchInfo.Capture(...).Throw()
+* instead of `throw inner`, so the original worker stack trace survives. Before
+* this, every parallel worker exception was rebranded as RunParallelPath.MoveNext
+* in the log, making cross-thread races (e.g. the OccupiedZoneIndices HashSet
+* race fixed in WorldSurveyData v1.0.4) effectively undiagnosable.
+* That is why ashenius' report was making non sense at all.
 *
 * Architecture overview:
 *   1. BuildSpatialStreams groups location types by GTS (similarity group),
@@ -367,12 +378,8 @@ namespace LPA
             {
                 if (t.IsFaulted)
                 {
-                    Exception inner = t.Exception.InnerException;
-                    if (inner != null)
-                    {
-                        throw inner;
-                    }
-                    throw t.Exception;
+                    Exception inner = t.Exception?.InnerException ?? t.Exception;
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(inner).Throw();
                 }
             }
 
@@ -432,22 +439,25 @@ namespace LPA
             }
 
             GenerationProgress.ClearThreadSlots();
-            if (_locationsGeneratedProp != null)
+            if (!ApiState.IsApiRun)
             {
-                _locationsGeneratedProp.SetValue(zsP, true);
-            }
-            else
-            {
-                DiagnosticLog.WriteLog(
-                    "[LPA] WARNING: Could not set LocationsGenerated via reflection.",
-                    BepInEx.Logging.LogLevel.Error);
+                if (_locationsGeneratedProp != null)
+                {
+                    _locationsGeneratedProp.SetValue(zsP, true);
+                }
+                else
+                {
+                    DiagnosticLog.WriteLog(
+                        "[LPA] WARNING: Could not set LocationsGenerated via reflection.",
+                        BepInEx.Logging.LogLevel.Error);
+                }
             }
 
             SurveyMode.DumpDiagnostics();
             DiagnosticLog.DumpPlacementsToFile();
             GenerationProgress.CurrentLocation = null;
             RelaxationTracker.MarkPlacementComplete();
-            GenerationProgress.EndGeneration();
+            GenerationProgress.EndGeneration(ApiState.IsApiRun);
 
             _workQueue?.Dispose();
             _workQueue = null;

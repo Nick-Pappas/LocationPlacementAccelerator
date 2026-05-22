@@ -1,4 +1,4 @@
-// v1
+// v1.1
 /**
 * Splits each location type's total quantity into individual work packets
 * and interleaves them round-robin across similarity groups. This prevents
@@ -7,6 +7,16 @@
 *
 * When interleaving is OFF, this still acts as the authoritative source for
 * PendingPackets and OriginalLocations, and handles budget calculation.
+*
+* 1.1: Added BuildApiWorkList + ResetApiState for the LPA public API path.
+* The API needs the same packetization machinery as world-gen but must NEVER
+* mutate ZoneSystem.m_locations. BuildApiWorkList clones the caller's
+* PlacementRequest list, then subtracts the current m_locationInstances
+* count per prefab to derive each clone's m_quantity. This matches vanilla
+* UW DistributeLocations semantics exactly as I understood them:
+* TargetQuantity is the WORLD target, the engine adds (target - current) more instances.
+* UW's own sweep happens before the API call, so the count reflects whatever survived.
+* ResetApiState mirrors RestoreLocations but skips the zsP.m_locations writeback.
 */
 #nullable disable
 using System.Collections.Generic;
@@ -115,6 +125,11 @@ namespace LPA
 
         private static List<ZoneLocation> ProcessTier(List<ZoneLocation> tierP, int baseBudgetP)
         {
+            return ProcessTier(tierP, baseBudgetP, true);
+        }
+
+        private static List<ZoneLocation> ProcessTier(List<ZoneLocation> tierP, int baseBudgetP, bool subtractAlreadyPlacedP)
+        {
             List<ZoneLocation> result = new List<ZoneLocation>();
             Dictionary<string, Queue<ZoneLocation>> queues = new Dictionary<string, Queue<ZoneLocation>>();
             ZoneSystem zs = ZoneSystem.instance;
@@ -134,7 +149,7 @@ namespace LPA
                 }
 
                 int alreadyPlaced = 0;
-                if (zs != null)
+                if (subtractAlreadyPlacedP && zs != null)
                 {
                     foreach (LocationInstance inst in zs.m_locationInstances.Values)
                     {
@@ -312,6 +327,127 @@ namespace LPA
                     loc.m_exteriorRadius = relaxedLocP.m_exteriorRadius;
                 }
             }
+        }
+
+        /**
+        * The LPA public API entry.
+        * 
+        * Builds the per call work list from a PlacementRequest collection without ever touching zsP.m_locations.
+        *
+        * Sets OriginalLocations to the non packet-ized clone snapshot so the
+        * parallel engine's RunParallelPath can read it as the source oftruth
+        * (each entry's m_quantity == TargetQuantity, no packets). 
+        * Returns the packet-ized list (when interleaving is on)
+        * or a fresh copy of the snapshot (when off) for the sequential
+        * engine's BuildTokenList path.
+        *
+        * subtractAlreadyPlaced is applied here at clone time so the non-interleaved 
+        * branch sees the corrected m_quantity too. 
+        * 
+        * A bit of a stupid comment 
+        */
+        public static List<ZoneLocation> BuildApiWorkList(System.Collections.Generic.IEnumerable<PlacementRequest> requestsP, bool interleavedOverrideP)
+        {
+            _budgets.Clear();
+            PendingPackets.Clear();
+            LoggedStarts.Clear();
+            IsGenerating = true;
+
+            ZoneSystem zs = ZoneSystem.instance;
+
+            // Pre-count current instances per requested prefab so we can subtract
+            // once upfront rather than per-tier.
+            Dictionary<string, int> currentCounts = new Dictionary<string, int>(System.StringComparer.Ordinal);
+            HashSet<string> wantedPrefabs = new HashSet<string>(System.StringComparer.Ordinal);
+            foreach (PlacementRequest req in requestsP)
+            {
+                if (req.Location != null)
+                {
+                    wantedPrefabs.Add(req.Location.m_prefabName);
+                }
+            }
+            if (zs != null)
+            {
+                foreach (LocationInstance inst in zs.m_locationInstances.Values)
+                {
+                    string n = inst.m_location.m_prefabName;
+                    if (!wantedPrefabs.Contains(n))
+                    {
+                        continue;
+                    }
+                    currentCounts.TryGetValue(n, out int c);
+                    currentCounts[n] = c + 1;
+                }
+            }
+
+            List<ZoneLocation> snapshot = new List<ZoneLocation>();
+            foreach (PlacementRequest req in requestsP)
+            {
+                if (req.Location == null)
+                {
+                    continue;
+                }
+                ZoneLocation clone = CloneLocation(req.Location);
+                int target = Mathf.Max(0, req.TargetQuantity);
+                currentCounts.TryGetValue(req.Location.m_prefabName, out int already);
+                clone.m_quantity = Mathf.Max(0, target - already);
+                snapshot.Add(clone);
+            }
+            OriginalLocations = snapshot;
+
+            if (!interleavedOverrideP)
+            {
+                foreach (ZoneLocation loc in snapshot)
+                {
+                    if (loc.m_enable && loc.m_quantity > 0)
+                    {
+                        PendingPackets[loc.m_prefabName] = loc.m_quantity;
+                    }
+                }
+                DiagnosticLog.WriteTimestampedLog(
+                    $"[Dispatcher] API run, interleaving OFF. {snapshot.Count} requests passed straight through.");
+                return new List<ZoneLocation>(snapshot);
+            }
+
+            List<ZoneLocation> prio = new List<ZoneLocation>();
+            List<ZoneLocation> nonPrio = new List<ZoneLocation>();
+            for (int i = 0; i < snapshot.Count; i++)
+            {
+                ZoneLocation loc = snapshot[i];
+                if (!loc.m_enable || loc.m_quantity <= 0)
+                {
+                    continue;
+                }
+                if (loc.m_prioritized)
+                {
+                    prio.Add(loc);
+                }
+                else
+                {
+                    nonPrio.Add(loc);
+                }
+            }
+
+            List<ZoneLocation> packetized = new List<ZoneLocation>();
+            packetized.AddRange(ProcessTier(prio, 200000, false));
+            packetized.AddRange(ProcessTier(nonPrio, 100000, false));
+            DiagnosticLog.WriteTimestampedLog(
+                $"[Dispatcher] API run, interleaved. {snapshot.Count} requests packetized to {packetized.Count} entries.");
+            return packetized;
+        }
+
+        /**
+        * LPA public API cleanup. Monkeys the state clearing parts of
+        * RestoreLocations but on purpsoe skips the zsP.m_locations
+        * writeback as the API path never mutated it in the first place.
+        */
+        public static void ResetApiState()
+        {
+            _budgets.Clear();
+            PendingPackets.Clear();
+            LoggedStarts.Clear();
+            OriginalLocations = null;
+            IsGenerating = false;
         }
 
         public static void RestoreLocations(ZoneSystem zsP)

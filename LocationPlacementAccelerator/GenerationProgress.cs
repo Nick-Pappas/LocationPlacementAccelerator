@@ -1,4 +1,4 @@
-// v6 
+// v6.2
 /**
 * Generation lifecycle management, placement counters, and UI text building.
 * Coordinates between placement engines, diagnostics, and the progress overlay.
@@ -26,6 +26,10 @@
 *   what I was seeing in Strike's logs on Discord for healthy locations like 
 *   StartTemple on genloc-on-saved-world). _totalRequested (the 
 *   overlay denominator) uses the same deducted value so it matches mid-run.
+*   
+*   I do not remember why I had 6.1... wtf
+*   6.2 fixes the overcounting that happens through the API (what ashenius showed me in Discord). 
+*   So correct in world gen but undercounting in API runs. 
 */
 #nullable disable
 using BepInEx.Logging;
@@ -221,8 +225,24 @@ namespace LPA
             for (int i = 0; i < _validLocations.Count; i++)
             {
                 ZoneLocation loc = _validLocations[i];
-                _preExistingCounts.TryGetValue(loc.m_prefabName, out int preExisting);
-                int needed = loc.m_quantity - preExisting;
+                /**
+                * loc.m_quantity meaning differs by path:
+                *   World-gen: world target. Subtract preExisting to get this-run need.
+                *   API: BuildApiWorkList already wrote (target - alreadyPlaced) into
+                *        clone.m_quantity, so it's ALREADY the this-run need. Subtracting
+                *        preExisting again undercounts _totalRequested and produces > 100%
+                *        success ratios.
+                */
+                int needed;
+                if (ApiState.IsApiRun)
+                {
+                    needed = loc.m_quantity;
+                }
+                else
+                {
+                    _preExistingCounts.TryGetValue(loc.m_prefabName, out int preExisting);
+                    needed = loc.m_quantity - preExisting;
+                }
                 if (needed > 0)
                 {
                     total += needed;
@@ -440,6 +460,11 @@ namespace LPA
 
         public static void EndGeneration()
         {
+            EndGeneration(false);
+        }
+
+        public static void EndGeneration(bool isApiP)
+        {
             if (!_initialized)
             {
                 return;
@@ -453,11 +478,10 @@ namespace LPA
             DiagnosticLog.WriteTimestampedLog($"=== GLOBAL END: Generating Locations ({_modeName}) ===");
             DiagnosticLog.WriteBlankLine();
 
-            if (ZoneSystem.instance != null)
+            if (!isApiP && ZoneSystem.instance != null)
             {
                 Interleaver.RestoreLocations(ZoneSystem.instance);
 
-                // Deduplicate m_locations in case relaxation packets created duplicates.
                 HashSet<ZoneLocation> seen = new HashSet<ZoneLocation>();
                 List<ZoneLocation> distinctList = new List<ZoneLocation>();
                 for (int i = 0; i < ZoneSystem.instance.m_locations.Count; i++)
@@ -471,7 +495,10 @@ namespace LPA
                 ZoneSystem.instance.m_locations.AddRange(distinctList);
             }
 
-            ConstraintRelaxer.RestoreQuantities();
+            if (!isApiP)
+            {
+                ConstraintRelaxer.RestoreQuantities();
+            }
 
             int totalActualPlaced = 0;
             Dictionary<string, int> finalCounts = new Dictionary<string, int>();
@@ -507,9 +534,21 @@ namespace LPA
                 * that's not a failure. Without this subtraction the summary paired 
                 * an un-deducted requested (N) with GetActualPlacedCount's deducted 
                 * placed (0) and reported "0/N Complete failure" for healthy quotas.
+                *
+                * API mode: loc.m_quantity is already (target - alreadyPlaced) from
+                * BuildApiWorkList. Subtracting preExisting again double-counts.
+                * See the matching gate in the _totalRequested computation above.
                 */
-                _preExistingCounts.TryGetValue(loc.m_prefabName, out int preExisting);
-                int requested = loc.m_quantity - preExisting;
+                int requested;
+                if (ApiState.IsApiRun)
+                {
+                    requested = loc.m_quantity;
+                }
+                else
+                {
+                    _preExistingCounts.TryGetValue(loc.m_prefabName, out int preExisting);
+                    requested = loc.m_quantity - preExisting;
+                }
                 if (requested <= 0)
                 {
                     continue;
@@ -632,15 +671,13 @@ namespace LPA
 
             ProgressOverlay.DestroyInstance();
             ThreadSafePRNG.Reset();
-            WorldSurveyData.Reset();
-            SurveyMode.Reset();
 
-            /**
-            * Re-arm the engine prefix so a second genloc in the same session actually 
-            * runs again. Without this the first call latched _firstCallDone/_v2Started
-            * and every subsequent call just got suppressed silently.
-            */
-            ReplacedEnginePatches.Reset();
+            if (!isApiP)
+            {
+                WorldSurveyData.Reset();
+                SurveyMode.Reset();
+                ReplacedEnginePatches.Reset();
+            }
 
             _initialized = false;
         }

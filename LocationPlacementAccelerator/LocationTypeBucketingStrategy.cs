@@ -1,4 +1,4 @@
-// v1.0.2
+// v1.0.3
 /**
 * LT (Location Type) bucketing strategy!
 * I wrote this second, after my original biome bucketing strategy to compare experimentally.
@@ -27,6 +27,8 @@
 * 1.0.1: searchBiome widened to long to match the widened ZoneProfile.BiomeMask
 * so custom EWD biomes beyond bit 15 participate in candidate filtering.
 * 1.0.2: Sign-extension fix on the (long) cast. See WorldSurveyData notes.
+*
+* 1.0.3: AllowedZones filter for the LPA public API.
 */
 #nullable disable
 using System;
@@ -55,6 +57,14 @@ namespace LPA
             _candidateCache.TryRemove(prefabNameP, out _);
             _explorationIndex.TryRemove(prefabNameP, out _);
             _visitPass.TryRemove(prefabNameP, out _);
+        }
+
+        public override void ClearAllCaches()
+        {
+            _candidateCache.Clear();
+            _explorationIndex.Clear();
+            _visitPass.Clear();
+            _exhaustedLocations.Clear();
         }
 
         public override void DumpDiagnostics() { }
@@ -126,7 +136,7 @@ namespace LPA
                 result = candidates[idx];
                 bool hasIdx = WorldSurveyData.ZoneToIndex.TryGetValue(result, out int zoneIndex);
 
-                if (hasIdx && WorldSurveyData.OccupiedZoneIndices.Contains(zoneIndex))
+                if (hasIdx && WorldSurveyData.OccupiedZoneIndices.ContainsKey(zoneIndex))
                 {
                     // I do not care about order one iota here.Thus a great opportunity for a bada boom bada bam O(1) by swapping with last and popping.
                     int last = candidates.Count - 1;
@@ -149,7 +159,7 @@ namespace LPA
         {
             if (zoneIndexP >= 0)
             {
-                WorldSurveyData.OccupiedZoneIndices.Add(zoneIndexP);
+                WorldSurveyData.OccupiedZoneIndices.TryAdd(zoneIndexP, 0);
             }
         }
 
@@ -186,11 +196,9 @@ namespace LPA
             // (uint) cast first to prevent sign extension when biome bit 31 is set.
             long searchBiome = (long)(uint)(int)locationP.m_biome;
 
-            // AshLands locations with sub-sea-level altitude ranges need to match
-            // my homebrewed BiomeBoilingOcean flag set during survey.
-            // NOTE (1.0.1): literal AshLands reference retained. This is geometry-specific
-            // (below-sea reclassification of vanilla AshLands zones) not a generic lava-biome
-            // check. Flagged for a future pass to generalize across EWD custom lava biomes.
+            // AshLands locations with sub-sea-level altitude ranges need to match my homebrewed BiomeBoilingOcean flag set during survey.
+            // Err.. note. literal AshLands reference retained. This is geometry-specific (below-sea reclassification of vanilla AshLands zones) not a generic lava-biome check.
+            // Flagged for a future pass to generalize across EWD custom lava biomes.
             bool isAshLands = (searchBiome & (long)Heightmap.Biome.AshLands) != 0L;
             if (isAshLands && locationP.m_minAltitude < -4.0f)
             {
@@ -214,6 +222,9 @@ namespace LPA
                 maxD = locationP.m_maxDistance;
             }
 
+            // Pulled out of the loop so the no-mask path stays a single null check.
+            HashSet<Vector2i> allowedZones = ApiState.AllowedZones;
+
             for (int i = 0; i < WorldSurveyData.Grid.Length; i++)
             {
                 ZoneProfile zone = WorldSurveyData.Grid[i];
@@ -233,6 +244,15 @@ namespace LPA
                 Vector3 center = ZoneSystem.GetZonePos(zone.ID);
                 float dist = center.magnitude;
                 if (dist < minD || dist > maxD)
+                {
+                    continue;
+                }
+
+                // API-mode zone allow-list. Applied AFTER the cheap mask checks
+                // so we only pay the HashSet lookup on zones that would otherwise
+                // be kept. Never dropped during relaxation - the allow-list is
+                // absolute, only the location-internal constraints relax.
+                if (allowedZones != null && !allowedZones.Contains(zone.ID))
                 {
                     continue;
                 }
