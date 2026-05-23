@@ -17,42 +17,26 @@
 * path worked correctly before this fix; the multi-world lifecycle was the hole.
 *
 * 1.0.4 diagnostic blocks left in place, commented out. Wild goose chase, 
-* hair pulling. Every test scenario I could think of - fresh world, vanilla-
-* generated world loaded with LPA, LPA-generated world reloaded, logout-and-
-* reload without exiting, with and without MWL, with and without EWD - hit 
-* TryLoadMinimapTextureData correctly and returned true. Cannot reproduce the 
-* saved-world regeneration bug.
+* hair pulling. Every test scenario I could think of - fresh world, vanilla generated world loaded with LPA, LPA-generated world reloaded, logout and reload without exiting, with and without MWL, with and without EWD
+* hit TryLoadMinimapTextureData correctly and returned true. Cannot reproduce the saved-world regeneration bug.
 *
-* 1.0.5  the clean follow-up to 1.04: the diagnostic 
-* file-writer machinery is gone (DiagWrite, the dedicated LPA_MinimapDiagnostic.log file, 
-* the per-call counters, the LoadImage and EncodeToPNG reflection probes, 
-* the path FieldRefs that only existed for * diagnostic logging). 
-* The packing fix stays is here to stay.The removal of the duplicate SaveMapTextureDataToDisk 
-* invocation stays. If the EWS-regen bug ever needs re-investigation, I can pull the diagnostic 
-* from a 1.0.4-tagged git revision; reinventing it from scratch would be a PIA. 
+* 1.0.5  the clean follow-up to 1.04: the diagnostic file-writer machinery is gone.
+* The packing fix  is here to stay.The removal of the duplicate SaveMapTextureDataToDisk invocation stays. 
+* If the EWS-regen bug ever needs re-investigation, I can pull the diagnostic from a 1.0.4-tagged git revision; reinventing it from scratch would be a PIA. 
 * I do not remember if I fixed the EWS regen... I need to look. 
 *
-* 1.0.6  16k map support. The original _heights as Color[] could not survive 
-* the multiplier-8 case: 16384*16384*16 bytes = 4.29 GB single object, instantly 
-* OOM under the CLR's 2 GB single-object ceiling. Replaced with a ushort[] half-
-* float buffer encoded directly via Mathf.FloatToHalf, uploaded via the native 
-* SetPixelData<ushort> path. The runtime height texture is RHalf (16-bit single-
-* channel float) so this is the canonical zero-conversion upload.  I hand Unity 
-* the exact bits it would have produced internally from a Color[] anyway. Memory 
-* drops from 4.29 GB to 256 MB for that buffer at 16k, and the upload is one 
-* native call instead of an internal per-pixel float-to-half conversion across 
-* the whole array.
+* 1.0.6  16k map support. The original _heights as Color[] could not survive the multiplier-8 case: 16384*16384*16 bytes = 4.29 GB single object, instantly OOM under the CLR's 2 GB single-object ceiling. 
+* Replaced with a ushort[] half float buffer encoded directly via Mathf.FloatToHalf, uploaded via the native 
+* SetPixelData<ushort> path. The runtime height texture is RHalf (16-bit single channel float) so this is the canonical zero-conversion upload.  I hand Unity 
+* the exact bits it would have produced internally from a Color[] anyway. Memory drops from 4.29 GB to 256 MB for that buffer at 16k, and the upload is one 
+* native call instead of an internal per-pixel float-to-half conversion across the whole array.
 *
 * Also closed an exception-safety hole in Prefix: previously _started was set 
-* AFTER LaunchGeneration returned, so if LaunchGeneration threw (e.g. the original 
-* OOM at 16k) the next Minimap.Update tick re-entered the same branch and re-threw, 
-* spamming the log with infinitely repeating stack traces. _started is now set 
-* before the call so a single failure stops the cycle.
+* AFTER LaunchGeneration returned, so if LaunchGeneration threw (e.g. the original OOM at 16k) the next Minimap.Update tick re-entered the same branch and re-threw, 
+* spamming the log with infinitely repeating stack traces. _started is now set  before the call so a single failure stops the cycle.
 *
-* The disk-save path is unchanged - _heightPacked stays as Color32[] in vanilla's 
-* (R<<8 + G)/127.5 encoding, written to a temporary RGBA32 texture for the PNG 
-* round-trip. Anything that touches the on-disk format stays bit-identical to 
-* vanilla so saved-world cache loads keep working.
+* The disk-save path is unchanged - _heightPacked stays as Color32[] in vanilla's (R<<8 + G)/127.5 encoding, written to a temporary RGBA32 texture for the PNG.
+* Anything that touches the on-disk format stays bit-identical to vanilla so saved-world cache loads keep working.
 */
 #nullable disable
 using System;
@@ -194,10 +178,8 @@ namespace LPA
 
             if (!_started)
             {
-                // Set _started BEFORE the call. If LaunchGeneration throws (allocation 
-                // failure, etc.) we want the next Update tick to fall through to the 
-                // _task null-check below and log a single failure, not re-enter this 
-                // branch and re-throw forever.
+                // Set _started BEFORE the call. If LaunchGeneration throws (allocation failure, etc.) I want the next Update tick to fall through to the 
+                // _task null-check below and log a single failure, not re-enter this branch and re-throw forever like a lunatic.
                 _started = true;
                 LaunchGeneration(__instance);
                 return false;
@@ -205,9 +187,7 @@ namespace LPA
 
             if (_task == null)
             {
-                // LaunchGeneration threw before _task was assigned. One log line, then 
-                // wedged in this state until Reset() is called via game logout. Better 
-                // than infinite re-throw.
+                // LaunchGeneration threw before _task was assigned. One log line, then wedged in this state until Reset() is called via game logout. Better than infinite re-throw.
                 ModConfig.Log.LogError("[LPA] Minimap generation failed during launch; aborting parallel path. Falling back to vanilla on next world load.");
                 _started = false;
                 _cacheChecked = false;
@@ -325,7 +305,7 @@ namespace LPA
 
                         // match vanilla's GenerateWorldMap line 1392-1395 exactly. Earlier code used *65.535 with clamp at height=1000 vanilla expects *127.5 with clamp at packed=65025
                         // (i.e.height ~510m). Vanilla's TryLoadMinimapTextureData unpacks with /127.5, so any mismatch in the multiplier corrupts the height on the next saved-world load.
-                        // See header docblock for full rationale if I forget the situation. 
+                        // See header for the full spill if I forget the situation. 
                         int packed = Mathf.Clamp((int)(biomeHeight * 127.5f), 0, 65025);
                         _heightPacked[idx] = new Color32((byte)(packed >> 8), (byte)(packed & 255), 0, byte.MaxValue);
                     }
