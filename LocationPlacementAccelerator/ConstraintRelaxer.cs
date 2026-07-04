@@ -1,4 +1,4 @@
-// v1.0.5
+// v1.0.6
 
 /**
 * Smart recovery system for vital location types. When a critical type
@@ -24,7 +24,7 @@
 * I do not pretend to relax to a value beyond the actual playable disk. The min 
 * distance side already clamped to 0; max side now mirrors that with WorldRadius.
 *
-* 1.0.4c: Added RestoreAllStats() for the LPA public API path. The existing
+* 1.0.4: Added RestoreAllStats() for the LPA public API path. The existing
 * RestoreQuantities only puts m_quantity back; it leaves the relaxed
 * altitude/distance/terrain/exteriorRadius values mutated on the ZoneLocations
 * in ZoneSystem.m_locations. World-gen tolerates this because the stats are
@@ -38,6 +38,15 @@
 * so even MaxRelaxationAttempts = 0 triggers concurrent writes when multiple
 * prefabs fail at the same moment. Same crash class as the OccupiedZoneIndices
 * HashSet race, non-thread-safe collection mutated from parallel workers.
+*
+* 1.0.6: Keyed on the logical TYPE KEY (Interleaver.GetTypeKey) instead of the prefab name. 
+* So the idea is that EWD clones are entirely different location types that share a prefab keyed per type, each
+* clone relaxes completely independently - its own attempt count, its own original-stats snapshot, its own restore and so on.... with ZERO clone awareness anywhere in this file. 
+* That is the whole point of the virtual key: to the relaxer a clone is simply a separate prefab.
+* The only two kind of not trivial edits are the two restore loops and SyncRelaxation's (in Interleaver), which now match m_locations entries by GetTypeKey(loc) == key instead of by
+* prefab name, so a Mountain-variant relaxation will (?) never bleed onto a BlackForest variant.
+* PlayabilityPolicy lookups (NeedsRelaxation, GetMinimumNeededCount) stay keyed on the real prefab name and playability is a property of the prefab's role, and those are config keys.
+* For any world without clones the type key equals the prefab name, so nothing changes. I am not sure how the hell I am gonna test this, without having making those crazy yamls. Ask Dhakhar or JP to give me some. 
 */
 #nullable disable
 using System;
@@ -87,7 +96,7 @@ namespace LPA
                 ZoneLocation loc = null;
                 for (int i = 0; i < zs.m_locations.Count; i++)
                 {
-                    if (zs.m_locations[i].m_prefabName == kvp.Key)
+                    if (Interleaver.GetTypeKey(zs.m_locations[i]) == kvp.Key)
                     {
                         loc = zs.m_locations[i];
                         break;
@@ -106,15 +115,10 @@ namespace LPA
         }
 
         /**
-        * Full rollback for the LPA public API path. Where RestoreQuantities
-        * only puts m_quantity back, this restores every relaxed field on the
-        * matching ZoneLocation in ZoneSystem.m_locations (altitude bounds,
-        * distance bounds, terrain delta bounds, exterior radius). The
-        * snapshot was taken on first relaxation in TryRelax / EnsureSnapshot
-        * (whichever fires first), so this is a no-op when nothing was
-        * relaxed during the call. Called from LPA.API.RunCustomPlacement's
-        * finally so consecutive API calls start each with the original
-        * world-defined constraints.
+        * Full rollback for the LPA public API path. Where RestoreQuantities only puts m_quantity back, this restores every relaxed field on the
+        * matching ZoneLocation in ZoneSystem.m_locations (altitude bounds,distance bounds, terrain delta bounds, exterior radius). 
+        * The snapshot was taken on first relaxation in TryRelax / EnsureSnapshot (whichever fires first), so this is a total no-op when nothing was
+        * relaxed during the call. Called from LPA.API.RunCustomPlacement's finally so consecutive API calls start each with the original world-defined constraints.
         */
         public static void RestoreAllStats()
         {
@@ -130,7 +134,7 @@ namespace LPA
                 for (int i = 0; i < zs.m_locations.Count; i++)
                 {
                     ZoneLocation loc = zs.m_locations[i];
-                    if (loc.m_prefabName != kvp.Key)
+                    if (Interleaver.GetTypeKey(loc) != kvp.Key)
                     {
                         continue;
                     }
@@ -164,27 +168,18 @@ namespace LPA
             }
 
             string prefabName = dataP.Loc.m_prefabName;
+            // Accounting key: distinct clones sharing this prefab each get their own type key, so their relaxation state never collides in theory.
+            // prefabName is kept only for the PlayabilityPolicy config lookups and the human-readable log lines below.
+            string typeKey = Interleaver.GetTypeKey(dataP.Loc);
 
-            int origQty = dataP.Loc.m_quantity;
-            if (Interleaver.OriginalLocations != null)
-            {
-                for (int i = 0; i < Interleaver.OriginalLocations.Count; i++)
-                {
-                    if (Interleaver.OriginalLocations[i].m_prefabName == prefabName)
-                    {
-                        origQty = Interleaver.OriginalLocations[i].m_quantity;
-                        break;
-                    }
-                }
-            }
+            int origQty = Interleaver.GetOriginalQuantity(dataP.Loc);
 
             /**
             * Use the placed count from the caller's ReportData.
             * DO NOT iterate m_locationInstances here. 
             * In the parallel path this method runs on a worker thread while DrainAndCommit() on the main
             * thread is concurrently calling RegisterLocation() -> m_locationInstances.Add().
-            * Iterating a Dictionary while another thread structurally modifies it
-            * throws InvalidOperationException("Collection was modified").
+            * Iterating a Dictionary while another thread structurally modifies it throws InvalidOperationException("Collection was modified"). 
             */
             int globalPlaced = dataP.Placed;
 
@@ -193,12 +188,12 @@ namespace LPA
                 return false;
             }
 
-            bool isFirstAttempt = !RelaxationAttempts.TryGetValue(prefabName, out int attempts);
+            bool isFirstAttempt = !RelaxationAttempts.TryGetValue(typeKey, out int attempts);
             if (isFirstAttempt)
             {
                 attempts = 0;
-                RelaxationAttempts[prefabName] = 0;
-                _originalStats[prefabName] = new OriginalStats
+                RelaxationAttempts[typeKey] = 0;
+                _originalStats[typeKey] = new OriginalStats
                 {
                     MinAlt = dataP.Loc.m_minAltitude,
                     MaxAlt = dataP.Loc.m_maxAltitude,
@@ -216,11 +211,11 @@ namespace LPA
                 DiagnosticLog.WriteTimestampedLog(
                     $"[Adjuster] {prefabName} failed after {maxAttempts} relaxation attempts. Abandoning.",
                     BepInEx.Logging.LogLevel.Warning);
-                RelaxationTracker.MarkRelaxationExhausted(prefabName);
+                RelaxationTracker.MarkRelaxationExhausted(typeKey);
                 return false;
             }
 
-            RelaxationAttempts[prefabName] = attempts + 1;
+            RelaxationAttempts[typeKey] = attempts + 1;
 
             PlacementBottleneck bottleneck = PlacementBottleneck.Unknown;
             float maxFailureRate = -1f;
@@ -252,7 +247,7 @@ namespace LPA
             float preMaxTerr = dataP.Loc.m_maxTerrainDelta;
             float preExtRad = dataP.Loc.m_exteriorRadius;
 
-            ApplyRelaxation(dataP.Loc, prefabName, bottleneck, attempts + 1, maxAttempts);
+            ApplyRelaxation(dataP.Loc, typeKey, bottleneck, attempts + 1, maxAttempts);
 
             string attemptDesc = BuildAttemptDescription(
                 bottleneck, attempts + 1,
@@ -261,14 +256,14 @@ namespace LPA
                 dataP.Loc.m_minDistance, dataP.Loc.m_maxDistance,
                 dataP.Loc.m_maxTerrainDelta, dataP.Loc.m_exteriorRadius);
 
-            RelaxationTracker.MarkRelaxationAttempt(prefabName, attemptDesc, dataP.Loc.m_prioritized);
+            RelaxationTracker.MarkRelaxationAttempt(typeKey, attemptDesc, dataP.Loc.m_prioritized);
 
             Interleaver.SyncRelaxation(dataP.Loc);
 
             int minimumNeeded = PlayabilityPolicy.GetMinimumNeededCount(prefabName, origQty);
             int toPlace = Mathf.Max(1, minimumNeeded - globalPlaced);
 
-            SurveyMode.ClearCache(dataP.PrefabName);
+            SurveyMode.ClearCache(typeKey);
 
             int fallbackBase = 200000;
             if (dataP.Loc.m_prioritized)
@@ -326,7 +321,7 @@ namespace LPA
             return true;
         }
 
-        private static void ApplyRelaxation(ZoneLocation locP, string prefabNameP, PlacementBottleneck bottleneckP, int attemptNumberP, int maxAttemptsP)
+        private static void ApplyRelaxation(ZoneLocation locP, string typeKeyP, PlacementBottleneck bottleneckP, int attemptNumberP, int maxAttemptsP)
         {
             float mag = ModConfig.RelaxationMagnitude.Value;
 
@@ -334,7 +329,7 @@ namespace LPA
                 $"[Adjuster] RELAXING {locP.m_prefabName} (Attempt {attemptNumberP}/{maxAttemptsP}). Bottleneck: {bottleneckP}. Attempting immediate retry.",
                 BepInEx.Logging.LogLevel.Message);
 
-            bool hasOrig = _originalStats.TryGetValue(prefabNameP, out OriginalStats orig);
+            bool hasOrig = _originalStats.TryGetValue(typeKeyP, out OriginalStats orig);
             if (!hasOrig)
             {
                 orig = new OriginalStats
@@ -468,13 +463,20 @@ namespace LPA
 
         public static string GetRelaxationSummary(string prefabNameP, ZoneLocation currentLocP)
         {
-            bool hasAttempts = RelaxationAttempts.TryGetValue(prefabNameP, out int attempts);
+            // Resolve through the location's type key so a clone reads its own relaxation record, not a same-prefab brother-sisters. prefabNameP is only the fallback when no location is supplied.
+            string key = prefabNameP;
+            if (currentLocP != null)
+            {
+                key = Interleaver.GetTypeKey(currentLocP);
+            }
+
+            bool hasAttempts = RelaxationAttempts.TryGetValue(key, out int attempts);
             if (!hasAttempts || attempts == 0)
             {
                 return "";
             }
 
-            bool hasOrig = _originalStats.TryGetValue(prefabNameP, out OriginalStats orig);
+            bool hasOrig = _originalStats.TryGetValue(key, out OriginalStats orig);
             if (!hasOrig)
             {
                 return $"(Relaxed {attempts} times)";

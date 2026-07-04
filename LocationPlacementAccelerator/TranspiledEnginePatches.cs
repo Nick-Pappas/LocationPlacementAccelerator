@@ -97,8 +97,7 @@
 * The short-circuit evaluation is STRUCTURALLY IMPORTANT here, not just an optimization.
 * Step 3 uses the variable 'val' which only exists because step 2 succeeded.
 * If step 1 fails, step 2 never executes, val is never declared, and step 3 is never
-* reached. If you rearrange the clauses, the code breaks. This idiom appears dozens of
-* times here. 
+* reached. If you rearrange the clauses, the code breaks. This idiom appears dozens of times here. 
 *
 * The transpilers:
 *

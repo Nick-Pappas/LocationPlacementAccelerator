@@ -1,4 +1,4 @@
-// v1.0.3
+// v1.0.4
 /**
 * LT (Location Type) bucketing strategy!
 * I wrote this second, after my original biome bucketing strategy to compare experimentally.
@@ -26,9 +26,16 @@
 *
 * 1.0.1: searchBiome widened to long to match the widened ZoneProfile.BiomeMask
 * so custom EWD biomes beyond bit 15 participate in candidate filtering.
+* 
 * 1.0.2: Sign-extension fix on the (long) cast. See WorldSurveyData notes.
 *
 * 1.0.3: AllowedZones filter for the LPA public API.
+*
+* 1.0.4: Cache keyed on the logical TYPE KEY (Interleaver.GetTypeKey) instead of the prefab name. 
+* Distinct EWD clones share a prefab but have DIFFERENT biomes/altitudes/shit, so a
+* prefab-keyed candidate list let the second clone inherit the first's biome-filtered zones
+* and then fail every biome check it could place nothing. Keyed per type, each clone scans and caches its own zone set.
+* For a world without clones the type key equals the prefab name, so this is a nothingburger there. ClearCache now receives a type key from the relaxer.
 */
 #nullable disable
 using System;
@@ -41,6 +48,7 @@ namespace LPA
 {
     public class LocationTypeBucketingStrategy : BucketingStrategy
     {
+        // All four keyed by the logical TYPE KEY (see Interleaver.GetTypeKey), not the prefab name so clone variants of one prefab never share a candidate list / cursor / exhaustion flag.
         private ConcurrentDictionary<string, List<Vector2i>> _candidateCache = new ConcurrentDictionary<string, List<Vector2i>>(StringComparer.Ordinal);
         private ConcurrentDictionary<string, int> _explorationIndex = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
         private ConcurrentDictionary<string, int> _visitPass = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
@@ -52,11 +60,11 @@ namespace LPA
             base.Initialize();
         }
 
-        public override void ClearCache(string prefabNameP)
+        public override void ClearCache(string typeKeyP)
         {
-            _candidateCache.TryRemove(prefabNameP, out _);
-            _explorationIndex.TryRemove(prefabNameP, out _);
-            _visitPass.TryRemove(prefabNameP, out _);
+            _candidateCache.TryRemove(typeKeyP, out _);
+            _explorationIndex.TryRemove(typeKeyP, out _);
+            _visitPass.TryRemove(typeKeyP, out _);
         }
 
         public override void ClearAllCaches()
@@ -72,16 +80,16 @@ namespace LPA
         public override bool GetZone(ZoneLocation locationP, out Vector2i result)
         {
             result = Vector2i.zero;
-            string prefabName = locationP.m_prefabName;
+            string typeKey = Interleaver.GetTypeKey(locationP);
 
-            if (!_candidateCache.TryGetValue(prefabName, out List<Vector2i> candidates))
+            if (!_candidateCache.TryGetValue(typeKey, out List<Vector2i> candidates))
             {
                 lock (_cacheLock)
                 {
-                    if (!_candidateCache.TryGetValue(prefabName, out candidates))
+                    if (!_candidateCache.TryGetValue(typeKey, out candidates))
                     {
-                        candidates = ScanWorldForCandidates(locationP, prefabName);
-                        _candidateCache.TryAdd(prefabName, candidates);
+                        candidates = ScanWorldForCandidates(locationP);
+                        _candidateCache.TryAdd(typeKey, candidates);
                     }
                 }
             }
@@ -100,37 +108,37 @@ namespace LPA
             {
                 if (candidates.Count == 0)
                 {
-                    HandleExhaustion(prefabName, 0, limit);
+                    HandleExhaustion(typeKey, 0, limit);
                     return false;
                 }
 
                 int pass = 0;
-                if (_visitPass.TryGetValue(prefabName, out int p))
+                if (_visitPass.TryGetValue(typeKey, out int p))
                 {
                     pass = p;
                 }
                 if (pass >= limit)
                 {
-                    HandleExhaustion(prefabName, candidates.Count, limit);
+                    HandleExhaustion(typeKey, candidates.Count, limit);
                     return false;
                 }
 
                 int idx = 0;
-                if (_explorationIndex.TryGetValue(prefabName, out int ei))
+                if (_explorationIndex.TryGetValue(typeKey, out int ei))
                 {
                     idx = ei;
                 }
                 if (idx >= candidates.Count)
                 {
-                    _visitPass[prefabName] = pass + 1;
+                    _visitPass[typeKey] = pass + 1;
                     if (pass + 1 >= limit)
                     {
-                        HandleExhaustion(prefabName, candidates.Count, limit);
+                        HandleExhaustion(typeKey, candidates.Count, limit);
                         return false;
                     }
                     Shuffle(candidates);
                     idx = 0;
-                    _explorationIndex[prefabName] = 0;
+                    _explorationIndex[typeKey] = 0;
                 }
 
                 result = candidates[idx];
@@ -150,7 +158,7 @@ namespace LPA
                 {
                     SurveyMode.CurrentActiveZoneIndex = zoneIndex;
                 }
-                _explorationIndex[prefabName] = idx + 1;
+                _explorationIndex[typeKey] = idx + 1;
                 return true;
             }
         }
@@ -167,29 +175,29 @@ namespace LPA
 
         public override List<Vector2i> GetOrBuildCandidateList(ZoneLocation locationP)
         {
-            string prefabName = locationP.m_prefabName;
-            if (!_candidateCache.TryGetValue(prefabName, out List<Vector2i> candidates))
+            string typeKey = Interleaver.GetTypeKey(locationP);
+            if (!_candidateCache.TryGetValue(typeKey, out List<Vector2i> candidates))
             {
                 lock (_cacheLock)
                 {
-                    if (!_candidateCache.TryGetValue(prefabName, out candidates))
+                    if (!_candidateCache.TryGetValue(typeKey, out candidates))
                     {
-                        candidates = ScanWorldForCandidates(locationP, prefabName);
-                        _candidateCache.TryAdd(prefabName, candidates);
+                        candidates = ScanWorldForCandidates(locationP);
+                        _candidateCache.TryAdd(typeKey, candidates);
                     }
                 }
             }
             return new List<Vector2i>(candidates);
         }
 
-        private void HandleExhaustion(string prefabNameP, int candidateCountP, int limitP)
+        private void HandleExhaustion(string typeKeyP, int candidateCountP, int limitP)
         {
-            _exhaustedLocations.TryAdd(prefabNameP, 0);
+            _exhaustedLocations.TryAdd(typeKeyP, 0);
             SurveyMode.SurveyExhausted = true;
             SurveyMode.CurrentActiveZoneIndex = -1;
         }
 
-        private List<Vector2i> ScanWorldForCandidates(ZoneLocation locationP, string prefabNameP)
+        private List<Vector2i> ScanWorldForCandidates(ZoneLocation locationP)
         {
             List<Vector2i> results = new List<Vector2i>();
             int requiredArea = (int)locationP.m_biomeArea;
@@ -198,7 +206,7 @@ namespace LPA
 
             // AshLands locations with sub-sea-level altitude ranges need to match my homebrewed BiomeBoilingOcean flag set during survey.
             // Err.. note. literal AshLands reference retained. This is geometry-specific (below-sea reclassification of vanilla AshLands zones) not a generic lava-biome check.
-            // Flagged for a future pass to generalize across EWD custom lava biomes.
+            // Flagged for a future pass to generalize across EWD custom lava biomes. Rereading this flaggin now June... wth custom lava biomes am I referring to. Something in VWE probably
             bool isAshLands = (searchBiome & (long)Heightmap.Biome.AshLands) != 0L;
             if (isAshLands && locationP.m_minAltitude < -4.0f)
             {
@@ -248,10 +256,8 @@ namespace LPA
                     continue;
                 }
 
-                // API-mode zone allow-list. Applied AFTER the cheap mask checks
-                // so we only pay the HashSet lookup on zones that would otherwise
-                // be kept. Never dropped during relaxation - the allow-list is
-                // absolute, only the location-internal constraints relax.
+                // API-mode zone allow-list. Applied AFTER the cheap mask checks so I only pay the HashSet lookup on zones that would otherwise be kept.
+                // Never dropped during relaxation, the allow-list is absolute, only the location-internal constraints relax.
                 if (allowedZones != null && !allowedZones.Contains(zone.ID))
                 {
                     continue;

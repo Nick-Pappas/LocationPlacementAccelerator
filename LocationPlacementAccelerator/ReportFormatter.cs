@@ -1,4 +1,4 @@
-// v1
+// v2
 /**
 * Formats placement reports for the diagnostic log. Produces both heartbeat
 * (mid-placement progress snapshots) and full funnel reports (post-placement
@@ -7,7 +7,12 @@
 * The funnel report walks the vanilla placement filter chain in order:
 * Distance --> Biome --> Altitude --> Forest --> Similarity --> Terrain --> Vegetation
 * and shows how many darts survived each stage.
-* 
+*
+* 2: The relaxation-state lookup (RelaxationAttempts) resolves through the location's logical
+* type key so a clone reports its own relaxation record rather than a same-prefab sibling's.
+* AggregateSessions (the uber telemetry) and the PlayabilityPolicy minimum stay prefab-keyed. 
+* Identical for non-clone situation, where the type key is the prefab name as before.
+* The display label is unchanged (the prefab name), clone disambiguation in the funnel header is left as a cosmetic follow-up thing.
 */
 #nullable disable
 using BepInEx.Logging;
@@ -155,7 +160,14 @@ namespace LPA
             }
             else
             {
-                bool wasRelaxed = ConstraintRelaxer.RelaxationAttempts.TryGetValue(prefabNameP, out int ra) && ra > 0;
+                // Relaxation state is keyed per logical type, resolve from the location so a clone reads its own record, not a same-prefab brothers' etc.
+                // prefabNameP is the fallback only when the report carries no location.
+                string relaxKey = prefabNameP;
+                if (dataP.Loc != null)
+                {
+                    relaxKey = Interleaver.GetTypeKey(dataP.Loc);
+                }
+                bool wasRelaxed = ConstraintRelaxer.RelaxationAttempts.TryGetValue(relaxKey, out int ra) && ra > 0;
                 int minNeeded = PlayabilityPolicy.GetMinimumNeededCount(prefabNameP, dataP.OriginalQuantity);
                 if (wasRelaxed && dataP.Placed >= minNeeded)
                 {
