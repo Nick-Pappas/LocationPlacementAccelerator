@@ -3,6 +3,9 @@
 * BepInEx plugin entry point for Location Placement Accelerator.
 * All configuration state lives in ModConfig. This class handles only
 * Harmony patch application, config file watching, and lifecycle.
+* 
+* Jul 2026.. ok the codebase is getting into a mess with the constant changes from EWD the adding the UW stuff and all that... 
+* Also the versioning schema of my archaeology stuff is hilariously inconsistent. Whatever, it does its job.
 */
 #nullable disable
 using BepInEx;
@@ -12,7 +15,7 @@ using System.Reflection;
 
 namespace LPA
 {
-    [BepInPlugin("nickpappas.locationplacementaccelerator", "Location Placement Accelerator", "1.0.23")]
+    [BepInPlugin("nickpappas.locationplacementaccelerator", "Location Placement Accelerator", "1.1.1")]//hopefully the last before PTB. 
     public class LPAPlugin : BaseUnityPlugin
     {
         private static Harmony _harmony;

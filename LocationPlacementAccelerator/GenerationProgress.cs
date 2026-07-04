@@ -1,4 +1,4 @@
-// v6.2
+// v6.3
 /**
 * Generation lifecycle management, placement counters, and UI text building.
 * Coordinates between placement engines, diagnostics, and the progress overlay.
@@ -30,6 +30,12 @@
 *   I do not remember why I had 6.1... wtf
 *   6.2 fixes the overcounting that happens through the API (what ashenius showed me in Discord). 
 *   So correct in world gen but undercounting in API runs. 
+*
+*   6.3: The two overlay/summary loops that look up a location for a relaxation row now match
+*   m_locations by Interleaver.GetTypeKey, not prefab name. RelaxationTracker entries are keyed
+*   per logical type now, so a clone's row carries a type key like "prefab#1". So matching by prefab
+*   name would fail to find the location and would drop the clone's relaxation line from the
+*   overlay without telling anyone. Display unchanged for non-clone worlds (type key == prefab name).
 */
 #nullable disable
 using BepInEx.Logging;
@@ -53,9 +59,8 @@ namespace LPA
         private static bool _isSurveying = false;
 
         /**
-        * Per-prefab snapshot of instance counts as they exist at the very start of
-        * placement (after the non-placed sweep). The EndGeneration tally subtracts
-        * these so the percentages and "placed N/M" strings reflect what LPA placed
+        * Per-prefab snapshot of instance counts as they exist at the very start of placement (after the non-placed sweep). 
+        * The EndGeneration tally subtracts these so the percentages and "placed N/M" strings reflect what LPA placed
         * this run, not what was already in the world from prior generations.
         */
         private static Dictionary<string, int> _preExistingCounts = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -205,11 +210,10 @@ namespace LPA
             }
 
             /**
-            * Snapshot the per-prefab counts that already exist in m_locationInstances
-            * right now. PlacementEngine.Run has already swept non-placed reservations
-            * so these are the genuine pre-existing placed structures from prior
-            * generations. Both the overlay denominator (_totalRequested) and the
-            * summary's per-location ratios subtract these so the numbers reflect
+            * Snapshot the per-prefab counts that already exist in m_locationInstances right now.
+            * PlacementEngine.Run has already swept non-placed reservations
+            * so these are the genuine pre-existing placed structures from prior generations.
+            * Both the overlay denominator (_totalRequested) and the summary's per-location ratios subtract these so the numbers reflect
             * "what this run still needs to do" rather than "world target vs this 
             * run's deltas", which was reporting already-met quotas as 0/N failures.
             */
@@ -227,11 +231,11 @@ namespace LPA
                 ZoneLocation loc = _validLocations[i];
                 /**
                 * loc.m_quantity meaning differs by path:
-                *   World-gen: world target. Subtract preExisting to get this-run need.
-                *   API: BuildApiWorkList already wrote (target - alreadyPlaced) into
-                *        clone.m_quantity, so it's ALREADY the this-run need. Subtracting
-                *        preExisting again undercounts _totalRequested and produces > 100%
-                *        success ratios.
+                *   World-gen: 
+                *   world target. Subtract preExisting to get this-run need.
+                *   API:
+                *   BuildApiWorkList already wrote (target alreadyPlaced) into clone.m_quantity, so it's ALREADY the this-run need. 
+                *   Subtracting preExisting again undercounts _totalRequested and produces > 100% success ratios.
                 */
                 int needed;
                 if (ApiState.IsApiRun)
@@ -424,7 +428,7 @@ namespace LPA
                     {
                         for (int i = 0; i < ZoneSystem.instance.m_locations.Count; i++)
                         {
-                            if (ZoneSystem.instance.m_locations[i].m_prefabName == name)
+                            if (Interleaver.GetTypeKey(ZoneSystem.instance.m_locations[i]) == name)
                             {
                                 locData = ZoneSystem.instance.m_locations[i];
                                 break;
@@ -527,17 +531,15 @@ namespace LPA
                 }
 
                 /**
-                * Genloc fix: "requested" is what this run still needs to place, not 
-                * the world target. If a quota was already met in a prior run (e.g. 
-                * StartTemple sitting under the player's feet), CenterFirstPlacer / 
-                * Interleaver correctly skip it, and the engine has nothing to do - 
-                * that's not a failure. Without this subtraction the summary paired 
-                * an un-deducted requested (N) with GetActualPlacedCount's deducted 
-                * placed (0) and reported "0/N Complete failure" for healthy quotas.
+                * Genloc fix: "requested" is what this run still needs to place, not the world target. 
+                * If a quota was already met in a prior run (e.g. StartTemple sitting under the player's feet), 
+                * CenterFirstPlacer / Interleaver correctly skip it, and the engine has nothing to do which is not a failure. 
+                * Without this subtraction the summary paired an un-deducted requested (N) with GetActualPlacedCount's deducted 
+                * placed (0) and reported "0/N Complete failure" for correct and quite healthy quotas.
                 *
-                * API mode: loc.m_quantity is already (target - alreadyPlaced) from
-                * BuildApiWorkList. Subtracting preExisting again double-counts.
-                * See the matching gate in the _totalRequested computation above.
+                * API mode: loc.m_quantity is already (target - alreadyPlaced) from BuildApiWorkList. 
+                * Subtracting preExisting again double-counts.
+                * If confused in the future I should look at the matching gate in the _totalRequested computation above.
                 */
                 int requested;
                 if (ApiState.IsApiRun)
@@ -651,7 +653,7 @@ namespace LPA
                     {
                         for (int i = 0; i < ZoneSystem.instance.m_locations.Count; i++)
                         {
-                            if (ZoneSystem.instance.m_locations[i].m_prefabName == kvp.Key)
+                            if (Interleaver.GetTypeKey(ZoneSystem.instance.m_locations[i]) == kvp.Key)
                             {
                                 locData = ZoneSystem.instance.m_locations[i];
                                 break;

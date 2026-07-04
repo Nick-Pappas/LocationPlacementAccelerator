@@ -1,4 +1,4 @@
-// v3.1
+// v3.2
 /**
 * Sequential placer for m_centerFirst locations (e.g. StartTemple / spawning altar).
 *
@@ -38,6 +38,10 @@
 * v3.1: API path filter. When ApiState.IsApiRun is true, only the
 * prefabs named in the request list participate and all other entries in
 * zsP.m_locations are skipped.
+*
+* v3.2: Fixed the max-similarity anchor check passing m_group where vanilla passes m_groupMax. Vanilla's
+* maxGroup=true HaveLocationInRange call keys on m_groupMax; feeding it m_group compared against the wrong
+* group, so a prioritized location's maxDistanceFromSimilar anchor requirement matched the wrong bucket.
 */
 #nullable disable
 using System.Collections.Generic;
@@ -223,7 +227,7 @@ namespace LPA
                     }
 
                     if (locP.m_maxDistanceFromSimilar > 0f &&
-                        !zsP.HaveLocationInRange(locP.m_prefabName, locP.m_group, p, locP.m_maxDistanceFromSimilar, true))
+                        !zsP.HaveLocationInRange(locP.m_prefabName, locP.m_groupMax, p, locP.m_maxDistanceFromSimilar, true))
                     {
                         continue;
                     }

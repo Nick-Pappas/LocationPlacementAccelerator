@@ -1,4 +1,4 @@
-// v1.0.7
+// v1.0.12
 /**
 * Multi-threaded placement path for the replacement engine.
 *
@@ -23,6 +23,49 @@
 * race fixed in WorldSurveyData v1.0.4) effectively undiagnosable.
 * That is why ashenius' report was making non sense at all.
 *
+* 1.0.8: Per-entry rekey and barrier fix and per-entry origQty and freaking multi-group.
+* EWD v1.64 makes location clones first-class DISTINCT entries that share one prefab name.
+* The per-job accounting was keyed by prefab name, so two clones E1/E2 collided:
+*   - _remainingToPlace[prefab] overwritten at init so... only the last clone's quota survived
+*     (E1 qty 50 + E2 qty 20 placed 20, not 70). This is what capped clone placement.
+*   - _inFlightRegions[prefab] shared one counter so it hit zero ONCE, so the per-entry completion (and its _prioritizedInFlight decrement) 
+*   fired once for N prioritized clones. _prioritizedInFlight never reached zero and the priority barrier hung. THE hang.
+*   I mean the one Ashenius was showing me happening.
+* So _inFlightRegions, _remainingToPlace, _counterLists, _telemetryLists, the renamed
+* _totalZonesPerEntry, and the spatial partition map are now keyed by the ZoneLocation
+* entry itself (reference identity, clones are different objects). Relaxation-created entries are new objects, so they key cleanly for free.
+* The barrier decrement now reads tw.Loc.m_prioritized (the ENTRY's own flag) instead of unit.
+* IsPrioritized (a per-STREAM flag). Priority and similarity groups are independent markers and a mixed-priority group would otherwise decrement a counter it never incremented.
+* Would make no sense.
+* origQty in DoFlushAndRelax now reads locP.m_quantity directly. The parallel path runs off OriginalLocations (un-packetized), 
+* so the entry's own m_quantity IS its target whereas Interleaver.GetOriginalQuantity returns the FIRST prefab match, conflating clones.
+* Defensive:
+* it only diverges if clones carry different quantities, which I am thinking about documenting as unsupported.
+* Cross-module handlers that are genuinely prefab-level stay prefab-keyed on purpose:
+* RelaxationTracker (one user-facing row per type), _centerFirstCounts (CenterFirstPlacer caps at one center-first instance per prefab), 
+* and TranspiledCompletionHandler.AggregateSessions (owned by the transpiled engine, the replaced path only writes-then-removes it, never reads).
+* The relaxation-state keying in ConstraintRelaxer and the serial-fallback dedup stay prefab-keyed
+* for now and move to per-origin in the separate lineage pass.
+* TypeRegionWork carries the resolved membership list (set once in BuildSpatialStreams, so the per-dart hot path does no lookup).
+* EvaluateZoneParallel and the commit go through the shared ConflictsWithSimilarMembers / CommitMemberships in Core.
+*
+* 1.0.9: Relaxation accounting routed through the logical type key (Interleaver.GetTypeKey), to match ConstraintRelaxer now writing RelaxationAttempts per type. 
+* DoFlushAndRelax and RunInlineRelaxation read RelaxationAttempts and call RelaxationTracker by type key.
+* the serial fallback's per-relaxation counters and its IsRelaxationSucceeded skip are per type, so one clone succeeding never suppresses a sibling clone's retry.
+* _centerFirstCounts and the PlayabilityPolicy lookups stay prefab-keyed (config / per-prefab semantics), and AggregateSessions stays prefab-keyed
+* (telemetry shared with the transpiled engine) so both identical for non-clone worlds.
+* Also... after Jere said that clones can be different, the entire clone different quantities thing is now supported.
+*
+* 1.0.10: Parallel dispatcher race condition fix. The batching logic eagerly dumped multiple map 
+* partitions of the same similarity group into the queue simultaneously. Because different partitions (colors) 
+* are adjacent in space, concurrent workers violated the distance constraints. Furthermore, it didn't wait for 
+* large-radius landlords to finish before starting small-radius tenants, which recreated the starvation bug from 
+* the sequential path. Added InFlightWorkUnits tracking to GtsStream to strictly gate dispatching, ensuring 
+* a group fully finishes its current spatial partition before moving to the next. Also removed the volatile 
+* keyword from InFlightWorkUnits as it triggers a CS0420 warning when used with Interlocked, using 
+* Volatile.Read instead. Finally, reverted an overly aggressive guard that skipped adding empty subgroups, 
+* which deadlocked the priority barrier for zero-candidate prioritized groups by starving their sentinels.
+*
 * Architecture overview:
 *   1. BuildSpatialStreams groups location types by GTS (similarity group),
 *      partitions each group's candidate zones into spatial regions using
@@ -40,7 +83,7 @@
 *      if the type needs smart recovery.
 *
 * Thread safety contracts:
-*   - _remainingToPlace / _inFlightRegions: per-prefab StrongBox<int>,
+*   - _remainingToPlace / _inFlightRegions: per-ENTRY StrongBox<int> (keyed by ZoneLocation),
 *     mutated via Interlocked. Workers decrement; zero triggers flush.
 *   - _resultQueue: ConcurrentQueue, lock-free enqueue from workers,
 *     dequeue on main thread only.
@@ -50,6 +93,22 @@
 *   
 *   Almost made me rename the mod from LPA to PIA.
 *   God class, with lots of god methods. Enjoy, me reading this a year from now.
+*
+* 1.0.11: Max-similarity / anchor inclusion. TypeRegionWork now carries the location's max advertise and search
+* membership sets (resolved in BuildSpatialStreams), EvaluateZoneParallel enforces the search set the same way
+* EvaluateZoneList commits the advertise set, and the relaxation path does likewise. ErrNotSim is aggregated in
+* AggregateCounters. Empty max sets for ordinary locations, so the parallel path is unchanged for them.
+* 
+* 1.0.12: Placement waves on the parallel path. The dispatch loop that used to run once now runs once per anchor tier,
+* lowest first, and does not open a tier until the previous one has fully drained, so a gated searcher never dispatches
+* against a host grid a lower tier has not finished painting. I pulled the whole prioritized/non-prioritized dispatch body
+* out verbatim into DispatchOneTier and left the graph-coloring color barriers untouched. The only new machinery is an
+* inter-tier barrier (_tierRemaining / _tierDone) that every entry decrements once at its WorkerBody completion point, plus
+* a per-tier reset of the priority barrier which is safe (? famours last words) because the inter-tier barrier guarantees no prior-tier worker is still
+* live. Workers spawn once and survive across tiers via GetConsumingEnumerable and CompleteAdding waits for the last tier.
+* The serial relaxation fallback is tier-ordered for the same reason. A world with no anchoring is a single tier, so this is  byte-for-byte the old schedule.
+* 
+* This is getting quite unmanageable. //TODO: get rid of all that crap and write it from scratch? *shudders*
 */
 #nullable disable
 using System;
@@ -73,22 +132,32 @@ namespace LPA
         private static int _prioritizedInFlight;
         private static ManualResetEventSlim _priorityBarrierDone;
 
+        /**
+        * Inter-tier barrier. Every entry in the tier currently dispatching decrements _tierRemaining once at its completion
+        * point in WorkerBody; the last one sets _tierDone, which is what the dispatcher waits on before opening the next tier.
+        */
+        private static int _tierRemaining;
+        private static ManualResetEventSlim _tierDone;
+
         private static ConcurrentDictionary<Vector2i, byte> _pendingOccupancy;
         private static Dictionary<Vector2i, LocationInstance> _occupancySnapshot;
 
-        // Per-prefab: how many region WorkUnits remain to be processed. Last decrement to 0 fires DoFlushAndRelax.
-        private static ConcurrentDictionary<string, StrongBox<int>> _inFlightRegions;
+        /**
+         * Per-entry: how many region WorkUnits remain to be processed. Last decrement to 0 fires DoFlushAndRelax.
+         * Keyed by the ZoneLocation entry (not prefab name!) so clone entries that share a prefab each get their own counter.
+         */
+        private static ConcurrentDictionary<ZoneLocation, StrongBox<int>> _inFlightRegions;
 
-        // Per-prefab: how many placements are still needed. Workers decrement on successful placement, stop when <= 0.
-        private static ConcurrentDictionary<string, StrongBox<int>> _remainingToPlace;
+        // Per-entry: how many placements are still needed. Workers decrement on successful placement, stop when <= 0.
+        private static ConcurrentDictionary<ZoneLocation, StrongBox<int>> _remainingToPlace;
 
         /**
-        * Per-prefab counter/telemetry lists - one entry per region that contains zones for the type.
+        * Per-entry counter/telemetry lists  one entry per region that contains zones for the type.
         * Pre-allocated on main thread during BuildSpatialStreams.
         * Workers write to their own pre-assigned instances (never to the list), aggregated by one worker at flush.
         */
-        private static ConcurrentDictionary<string, List<PlacementCounters>> _counterLists;
-        private static ConcurrentDictionary<string, List<TelemetryContext>> _telemetryLists;
+        private static ConcurrentDictionary<ZoneLocation, List<PlacementCounters>> _counterLists;
+        private static ConcurrentDictionary<ZoneLocation, List<TelemetryContext>> _telemetryLists;
 
         private static ConcurrentDictionary<string, byte> _startedPrefabs;
         private static object _ltsCompletionLock;
@@ -96,12 +165,13 @@ namespace LPA
         private static int _parallelTokensProcessed;
         private static int _parallelTotalZones;
 
-        private static ConcurrentDictionary<string, int> _totalZonesPerPrefab;
+        private static ConcurrentDictionary<ZoneLocation, int> _totalZonesPerEntry;
 
         private struct OrderedEntry
         {
             public ZoneLocation Loc;
             public int BaseQty;
+            public int OriginalIndex;
         }
 
         /**
@@ -112,16 +182,25 @@ namespace LPA
         {
             public List<TypeRegionWork> TypeWork;
             public bool IsPrioritized;
+            public GtsStream OwnerStream;
         }
 
         private class TypeRegionWork
         {
             public ZoneLocation Loc;
-            public string Group;
-            public PresenceGrid Grid;
+            // Resolved once in BuildSpatialStreams so the per-dart hot path never re-resolves.One entry for single-group/ungrouped, N for a genuine multi-group location.
+            public List<GroupMembership> Memberships;
+            // Resolved once alongside Memberships. Advertise = groups painted on placement (GroupsMax) Search = advertise plus any search-only anchors, queried per dart. Empty for ordinary locations.
+            public List<GroupMembership> MaxAdvertise;
+            public List<GroupMembership> MaxSearch;
             public List<Vector2i> Zones;
             public PlacementCounters Counters;
             public TelemetryContext TelCtx;
+        }
+
+        private class ColorBatch
+        {
+            public List<WorkUnit> WorkUnits;
         }
 
         /**
@@ -135,12 +214,14 @@ namespace LPA
             public List<SubGroupStream> SubGroups;
             public int CurrentSubGroup;
             public bool IsPrioritized;
+            public int InFlightWorkUnits; // Mutated via Interlocked. No volatile keyword to avoid CS0420. ""a reference to a volatile field will not be treated as volatile". I do not remember what was the deal here. Let it be.
         }
 
         private class SubGroupStream
         {
             public float MinDistFromSimilar;
-            public Queue<WorkUnit> WorkUnits;
+            public List<ColorBatch> Colors;
+            public int CurrentColorIndex;
         }
 
         private static IEnumerator RunParallelPath(ZoneSystem zsP, int locListSnapshotP)
@@ -169,10 +250,8 @@ namespace LPA
             for (int i = 0; i < srcLocations.Count; i++)
             {
                 ZoneLocation loc = srcLocations[i];
-                // EWD-mirror: blueprint locations have an empty AssetID + name-only
-                // SoftReference. The old m_prefab.IsValid check rejected them before
-                // they ever hit the work queue. IsValidLocation matches EWD's own
-                // IdManager.IsValid so blueprints now survive into RunParallelPath.
+                // EWD-mirror: blueprint locations have an empty AssetID + name-only SoftReference. The old m_prefab.IsValid check rejected them before
+                // they ever hit the work queue. IsValidLocation matches EWD's own IdManager.IsValid so blueprints now survive into RunParallelPath.
                 if (!loc.m_enable || !Compatibility.IsValidLocation(loc) || loc.m_quantity <= 0)
                 {
                     continue;
@@ -186,7 +265,11 @@ namespace LPA
                 {
                     continue;
                 }
-                ordered.Add(new OrderedEntry { Loc = loc, BaseQty = baseQty });
+                OrderedEntry entry = new OrderedEntry();
+                entry.Loc = loc;
+                entry.BaseQty = baseQty;
+                entry.OriginalIndex = i;
+                ordered.Add(entry);
             }
 
             ordered.Sort(CompareOrderedEntries);
@@ -198,34 +281,24 @@ namespace LPA
             _ltsCompletionLock = new object();
             _startedPrefabs = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             _priorityBarrierDone = new ManualResetEventSlim(false);
+            _tierDone = new ManualResetEventSlim(false);
             _parallelTokensProcessed = 0;
 
-            _inFlightRegions = new ConcurrentDictionary<string, StrongBox<int>>(StringComparer.Ordinal);
-            _remainingToPlace = new ConcurrentDictionary<string, StrongBox<int>>(StringComparer.Ordinal);
-            _counterLists = new ConcurrentDictionary<string, List<PlacementCounters>>(StringComparer.Ordinal);
-            _telemetryLists = new ConcurrentDictionary<string, List<TelemetryContext>>(StringComparer.Ordinal);
-            _totalZonesPerPrefab = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
+            _inFlightRegions = new ConcurrentDictionary<ZoneLocation, StrongBox<int>>();
+            _remainingToPlace = new ConcurrentDictionary<ZoneLocation, StrongBox<int>>();
+            _counterLists = new ConcurrentDictionary<ZoneLocation, List<PlacementCounters>>();
+            _telemetryLists = new ConcurrentDictionary<ZoneLocation, List<TelemetryContext>>();
+            _totalZonesPerEntry = new ConcurrentDictionary<ZoneLocation, int>();
 
             _parallelTotalZones = 0;
-            _prioritizedInFlight = 0;
             foreach (OrderedEntry entry in ordered)
             {
-                string prefabName = entry.Loc.m_prefabName;
-                _remainingToPlace[prefabName] = new StrongBox<int>(entry.BaseQty);
-                _inFlightRegions[prefabName] = new StrongBox<int>(0);
-                _counterLists[prefabName] = new List<PlacementCounters>();
-                _telemetryLists[prefabName] = new List<TelemetryContext>();
-                if (entry.Loc.m_prioritized)
-                {
-                    _prioritizedInFlight++;
-                }
-            }
-            if (_prioritizedInFlight == 0)
-            {
-                _priorityBarrierDone.Set();
+                _remainingToPlace[entry.Loc] = new StrongBox<int>(entry.BaseQty);
+                _inFlightRegions[entry.Loc] = new StrongBox<int>(0);
+                _counterLists[entry.Loc] = new List<PlacementCounters>();
+                _telemetryLists[entry.Loc] = new List<TelemetryContext>();
             }
 
-            List<GtsStream> gtsStreams = BuildSpatialStreams(ordered);
 
             GenerationProgress.InitThreadSlots(_parallelThreadCount);
             Task[] workerTasks = new Task[_parallelThreadCount];
@@ -235,128 +308,36 @@ namespace LPA
                 workerTasks[w] = Task.Run(() => WorkerBody(zsP, idx));
             }
 
-            bool crossedPriority = false;
             const long YieldIntervalMs = 100;// works well in the mt case. 
             Stopwatch yieldSw = Stopwatch.StartNew();
 
-            if (_interleavedScheduling)
+            /**
+            * Partition the sorted entries into tiers, keeping the existing sort within each tier, then dispatch one tier to
+            * completion before opening the next. That is what guarantees an advertiser's footprint exists before any gated
+            * searcher in a later tier reads its grid. With no anchoring every type is tier 0, so this is one pass, unchanged.
+            */
+            List<List<OrderedEntry>> orderedByTier = new List<List<OrderedEntry>>();
+            for (int e = 0; e < ordered.Count; e++)
             {
-                // Phase 1: round-robin prioritized streams until exhausted.
-                bool anyPrio = true;
-                while (anyPrio)
+                int tier = TierOf(ordered[e].Loc);
+                while (orderedByTier.Count <= tier)
                 {
-                    anyPrio = false;
-                    foreach (GtsStream stream in gtsStreams)
-                    {
-                        if (!stream.IsPrioritized)
-                        {
-                            continue;
-                        }
-                        if (stream.CurrentSubGroup >= stream.SubGroups.Count)
-                        {
-                            continue;
-                        }
-                        SubGroupStream csg = stream.SubGroups[stream.CurrentSubGroup];
-                        if (csg.WorkUnits.Count == 0)
-                        {
-                            stream.CurrentSubGroup++;
-                            if (stream.CurrentSubGroup < stream.SubGroups.Count)
-                            {
-                                anyPrio = true;
-                            }
-                            continue;
-                        }
-
-                        int batch = 1;
-                        if (stream.SubGroups.Count > 1)
-                        {
-                            batch = Math.Min(_parallelThreadCount, csg.WorkUnits.Count);
-                        }
-                        for (int b = 0; b < batch && csg.WorkUnits.Count > 0; b++)
-                        {
-                            _workQueue.Add(csg.WorkUnits.Dequeue());
-                        }
-                        anyPrio = true;
-                    }
+                    orderedByTier.Add(new List<OrderedEntry>());
                 }
-
-                // Wait for the priority barrier before feeding non-prioritized work.
-                while (!_priorityBarrierDone.IsSet)
-                {
-                    DrainAndCommit(zsP);
-                    UpdateAnnulus(zsP);
-                    if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs)
-                    {
-                        yieldSw.Restart();
-                        yield return null;
-                    }
-                }
-
-                // Phase 2: round-robin non-prioritized streams.
-                bool anyLeft = true;
-                while (anyLeft)
-                {
-                    anyLeft = false;
-                    foreach (GtsStream stream in gtsStreams)
-                    {
-                        if (stream.IsPrioritized)
-                        {
-                            continue;
-                        }
-                        if (stream.CurrentSubGroup >= stream.SubGroups.Count)
-                        {
-                            continue;
-                        }
-                        SubGroupStream csg = stream.SubGroups[stream.CurrentSubGroup];
-                        if (csg.WorkUnits.Count == 0)
-                        {
-                            stream.CurrentSubGroup++;
-                            if (stream.CurrentSubGroup < stream.SubGroups.Count)
-                            {
-                                anyLeft = true;
-                            }
-                            continue;
-                        }
-
-                        int batch = 1;
-                        if (stream.SubGroups.Count > 1)
-                        {
-                            batch = Math.Min(_parallelThreadCount, csg.WorkUnits.Count);
-                        }
-                        for (int b = 0; b < batch && csg.WorkUnits.Count > 0; b++)
-                        {
-                            _workQueue.Add(csg.WorkUnits.Dequeue());
-                        }
-                        anyLeft = true;
-                    }
-                }
+                orderedByTier[tier].Add(ordered[e]);
             }
-            else
+
+            for (int tier = 0; tier < orderedByTier.Count; tier++)
             {
-                // Non-interleaved: exhaust each stream completely before moving on.
-                foreach (GtsStream stream in gtsStreams)
+                List<OrderedEntry> tierEntries = orderedByTier[tier];
+                if (tierEntries.Count == 0)
                 {
-                    if (!crossedPriority && !stream.IsPrioritized)
-                    {
-                        crossedPriority = true;
-                        while (!_priorityBarrierDone.IsSet)
-                        {
-                            DrainAndCommit(zsP);
-                            UpdateAnnulus(zsP);
-                            if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs)
-                            {
-                                yieldSw.Restart();
-                                yield return null;
-                            }
-                        }
-                    }
-                    foreach (SubGroupStream sg in stream.SubGroups)
-                    {
-                        while (sg.WorkUnits.Count > 0)
-                        {
-                            _workQueue.Add(sg.WorkUnits.Dequeue());
-                        }
-                    }
+                    continue;
+                }
+                IEnumerator tierIter = DispatchOneTier(zsP, tierEntries, yieldSw);
+                while (tierIter.MoveNext())
+                {
+                    yield return tierIter.Current;
                 }
             }
 
@@ -383,7 +364,7 @@ namespace LPA
                 }
             }
 
-            // Final drain - exhaust everything remaining in the queue.
+            // Final drain... exhaust everything remaining in the queue.
             while (_resultQueue.TryDequeue(out PlacementResult finalResult))
             {
                 zsP.RegisterLocation(finalResult.Loc, finalResult.Position, false);
@@ -405,6 +386,37 @@ namespace LPA
                 List<ZoneLocation> relaxLocs = zsP.m_locations.GetRange(locListSnapshotP, newCount);
                 locListSnapshotP = zsP.m_locations.Count;
 
+                /**
+                 * Tier-order the fallback exactly as the main pass is tier-ordered: a host that only recovers in this serial
+                 * pass still has to precede its satellites, or a satellite retries against a grid the host has not painted.
+                 * I bucket by tier and walk low tiers first, preserving append order within a tier so the pass is deterministic. 
+                 * Used the word tier here 45 times. 
+                 */
+                int maxRelaxTier = 0;
+                for (int ri = 0; ri < relaxLocs.Count; ri++)
+                {
+                    int rt = TierOf(relaxLocs[ri]);
+                    if (rt > maxRelaxTier)
+                    {
+                        maxRelaxTier = rt;
+                    }
+                }
+                if (maxRelaxTier > 0)
+                {
+                    List<ZoneLocation> tierOrdered = new List<ZoneLocation>(relaxLocs.Count);
+                    for (int rtier = 0; rtier <= maxRelaxTier; rtier++)
+                    {
+                        for (int ri = 0; ri < relaxLocs.Count; ri++)
+                        {
+                            if (TierOf(relaxLocs[ri]) == rtier)
+                            {
+                                tierOrdered.Add(relaxLocs[ri]);
+                            }
+                        }
+                    }
+                    relaxLocs = tierOrdered;
+                }
+
                 Dictionary<string, PlacementCounters> rCtrs = new Dictionary<string, PlacementCounters>(StringComparer.Ordinal);
                 Dictionary<string, ZoneLocation> rRep = new Dictionary<string, ZoneLocation>(StringComparer.Ordinal);
                 foreach (ZoneLocation rx in relaxLocs)
@@ -413,19 +425,20 @@ namespace LPA
                     {
                         continue;
                     }
-                    string prefabName = rx.m_prefabName;
-                    // Skip if relaxation already succeeded inline on a worker thread.
-                    if (RelaxationTracker.IsRelaxationSucceeded(prefabName))
+                    // Per logical type: distinct clones relax independently, and a relaxation packet inherits its origin's type key so a single relaxation's packets group together.
+                    string typeKey = Interleaver.GetTypeKey(rx);
+                    // Skip if relaxation already succeeded inline on a worker thread keyed per type so one clone succeeding does not suppress a sibling clone's serial retry.
+                    if (RelaxationTracker.IsRelaxationSucceeded(typeKey))
                     {
                         continue;
                     }
-                    bool hasRCtr = rCtrs.ContainsKey(prefabName);
+                    bool hasRCtr = rCtrs.ContainsKey(typeKey);
                     if (!hasRCtr)
                     {
-                        rCtrs[prefabName] = new PlacementCounters();
-                        rRep[prefabName] = rx;
+                        rCtrs[typeKey] = new PlacementCounters();
+                        rRep[typeKey] = rx;
                     }
-                    IEnumerator it = RunLocSerial(zsP, rx, rCtrs[prefabName], suppressFlushP: true);
+                    IEnumerator it = RunLocSerial(zsP, rx, rCtrs[typeKey], suppressFlushP: true);
                     while (it.MoveNext())
                     {
                         yield return it.Current;
@@ -434,7 +447,8 @@ namespace LPA
                 foreach (KeyValuePair<string, ZoneLocation> k in rRep)
                 {
                     FlushLTS(zsP, k.Value, rCtrs[k.Key]);
-                    TranspiledCompletionHandler.AggregateSessions.Remove(k.Key);
+                    // AggregateSessions is prefab-keyed (telemetry, shared with the transpiled path), so remove by the representative's prefab name rather than the type-key map key.
+                    TranspiledCompletionHandler.AggregateSessions.Remove(k.Value.m_prefabName);
                 }
             }
 
@@ -463,6 +477,8 @@ namespace LPA
             _workQueue = null;
             _priorityBarrierDone?.Dispose();
             _priorityBarrierDone = null;
+            _tierDone?.Dispose();
+            _tierDone = null;
         }
 
         /**
@@ -537,7 +553,8 @@ namespace LPA
                     GroupKey = grpKey,
                     SubGroups = new List<SubGroupStream>(),
                     CurrentSubGroup = 0,
-                    IsPrioritized = gtsPriority[grpKey]
+                    IsPrioritized = gtsPriority[grpKey],
+                    InFlightWorkUnits = 0
                 };
 
                 foreach (float sgMinDist in subGroupDists)
@@ -547,28 +564,35 @@ namespace LPA
                     PartitionRule rule = SpatialPartitionAlgorithms.BuildRule(sgMinDist, _parallelThreadCount);
                     int partitionCount = rule.PartitionCount;
 
-                    // Build per-partition, per-type zone sublists. Candidate fetch + inline partition computation in one pass.
-                    Dictionary<string, List<Vector2i>>[] partitions = new Dictionary<string, List<Vector2i>>[partitionCount];
+                    // Build per-partition, per-BLOCK, per-ENTRY zone sublists. Keyed by the ZoneLocation entry so clone entries that share a prefab get their own distinct candidate lists.
+                    Dictionary<int, Dictionary<ZoneLocation, List<Vector2i>>>[] colorBlocks = new Dictionary<int, Dictionary<ZoneLocation, List<Vector2i>>>[partitionCount];//btw all these 2is will become 2ss in PTB.
                     for (int p = 0; p < partitionCount; p++)
                     {
-                        partitions[p] = new Dictionary<string, List<Vector2i>>(StringComparer.Ordinal);
+                        colorBlocks[p] = new Dictionary<int, Dictionary<ZoneLocation, List<Vector2i>>>();
                     }
 
                     int totalCandidateZones = 0;
                     foreach (OrderedEntry entry in sgEntries)
                     {
-                        string prefabName = entry.Loc.m_prefabName;
                         List<Vector2i> candidates = SurveyMode.GetOrBuildCandidateList(entry.Loc);
                         totalCandidateZones += candidates.Count;
 
                         foreach (Vector2i zone in candidates)
                         {
-                            int partition = SpatialPartitionAlgorithms.GetPartition(zone, ref rule);
-                            bool hasZoneList = partitions[partition].TryGetValue(prefabName, out List<Vector2i> zoneList);
+                            SpatialPartitionAlgorithms.GetPartition(zone, ref rule, out int colorIndex, out int blockId);
+
+                            bool hasBlockDict = colorBlocks[colorIndex].TryGetValue(blockId, out Dictionary<ZoneLocation, List<Vector2i>> locDict);
+                            if (!hasBlockDict)
+                            {
+                                locDict = new Dictionary<ZoneLocation, List<Vector2i>>();
+                                colorBlocks[colorIndex][blockId] = locDict;
+                            }
+
+                            bool hasZoneList = locDict.TryGetValue(entry.Loc, out List<Vector2i> zoneList);
                             if (!hasZoneList)
                             {
                                 zoneList = new List<Vector2i>();
-                                partitions[partition][prefabName] = zoneList;
+                                locDict[entry.Loc] = zoneList;
                             }
                             zoneList.Add(zone);
                         }
@@ -582,66 +606,79 @@ namespace LPA
                             $"partitions={partitionCount} mode={rule.Mode}");
                     }
 
-                    // Track how many regions each prefab appears in.
+                    // Track how many regions each entry appears in.
                     foreach (OrderedEntry entry in sgEntries)
                     {
-                        string prefabName = entry.Loc.m_prefabName;
                         int regionCount = 0;
                         for (int p = 0; p < partitionCount; p++)
                         {
-                            bool hasZones = partitions[p].TryGetValue(prefabName, out List<Vector2i> zoneList);
-                            if (hasZones && zoneList.Count > 0)
+                            foreach (KeyValuePair<int, Dictionary<ZoneLocation, List<Vector2i>>> blockKvp in colorBlocks[p])
                             {
-                                regionCount++;
+                                bool hasZones = blockKvp.Value.TryGetValue(entry.Loc, out List<Vector2i> zoneList);
+                                if (hasZones && zoneList.Count > 0)
+                                {
+                                    regionCount++;
+                                }
                             }
                         }
-                        Interlocked.Add(ref _inFlightRegions[prefabName].Value, regionCount);
+                        Interlocked.Add(ref _inFlightRegions[entry.Loc].Value, regionCount);
                     }
-
-                    PresenceGrid grid = PresenceGrid.GetOrCreate($"{grpKey}:{sgMinDist:F0}");
 
                     SubGroupStream sgs = new SubGroupStream
                     {
                         MinDistFromSimilar = sgMinDist,
-                        WorkUnits = new Queue<WorkUnit>()
+                        Colors = new List<ColorBatch>(),
+                        CurrentColorIndex = 0
                     };
 
                     for (int p = 0; p < partitionCount; p++)
                     {
-                        List<TypeRegionWork> typeWork = new List<TypeRegionWork>();
+                        ColorBatch colorBatch = new ColorBatch();
+                        colorBatch.WorkUnits = new List<WorkUnit>();
 
-                        foreach (OrderedEntry entry in sgEntries)
+                        foreach (KeyValuePair<int, Dictionary<ZoneLocation, List<Vector2i>>> blockKvp in colorBlocks[p])
                         {
-                            string prefabName = entry.Loc.m_prefabName;
-                            bool hasZones = partitions[p].TryGetValue(prefabName, out List<Vector2i> zones);
-                            if (!hasZones || zones.Count == 0)
+                            List<TypeRegionWork> typeWork = new List<TypeRegionWork>();
+
+                            foreach (OrderedEntry entry in sgEntries)
                             {
-                                continue;
+                                bool hasZones = blockKvp.Value.TryGetValue(entry.Loc, out List<Vector2i> zones);
+                                if (!hasZones || zones.Count == 0)
+                                {
+                                    continue;
+                                }
+
+                                PlacementCounters ctr = new PlacementCounters();
+                                TelemetryContext telCtx = new TelemetryContext();
+                                _counterLists[entry.Loc].Add(ctr);
+                                _telemetryLists[entry.Loc].Add(telCtx);
+
+                                typeWork.Add(new TypeRegionWork
+                                {
+                                    Loc = entry.Loc,
+                                    Memberships = ResolveSimilarityMemberships(entry.Loc),
+                                    MaxAdvertise = ResolveMaxAdvertiseMemberships(entry.Loc),
+                                    MaxSearch = ResolveMaxSearchMemberships(entry.Loc),
+                                    Zones = zones,
+                                    Counters = ctr,
+                                    TelCtx = telCtx
+                                });
                             }
 
-                            PlacementCounters ctr = new PlacementCounters();
-                            TelemetryContext telCtx = new TelemetryContext();
-                            _counterLists[prefabName].Add(ctr);
-                            _telemetryLists[prefabName].Add(telCtx);
-
-                            typeWork.Add(new TypeRegionWork
+                            if (typeWork.Count > 0)
                             {
-                                Loc = entry.Loc,
-                                Group = grpKey,
-                                Grid = grid,
-                                Zones = zones,
-                                Counters = ctr,
-                                TelCtx = telCtx
-                            });
+                                colorBatch.WorkUnits.Add(new WorkUnit
+                                {
+                                    TypeWork = typeWork,
+                                    IsPrioritized = stream.IsPrioritized,
+                                    OwnerStream = stream
+                                });
+                            }
                         }
 
-                        if (typeWork.Count > 0)
+                        if (colorBatch.WorkUnits.Count > 0)
                         {
-                            sgs.WorkUnits.Enqueue(new WorkUnit
-                            {
-                                TypeWork = typeWork,
-                                IsPrioritized = stream.IsPrioritized
-                            });
+                            sgs.Colors.Add(colorBatch);
                         }
                     }
 
@@ -651,29 +688,31 @@ namespace LPA
                 streams.Add(stream);
             }
 
-            // Compute total zones for annulus denominator and per-prefab tracking.
+            // Compute total zones for annulus denominator and per-entry tracking.
             int totalZones = 0;
-            Dictionary<string, int> prefabZones = new Dictionary<string, int>(StringComparer.Ordinal);
+            Dictionary<ZoneLocation, int> entryZones = new Dictionary<ZoneLocation, int>();
             foreach (GtsStream s in streams)
             {
                 foreach (SubGroupStream sg in s.SubGroups)
                 {
-                    foreach (WorkUnit wu in sg.WorkUnits)
+                    foreach (ColorBatch batch in sg.Colors)
                     {
-                        foreach (TypeRegionWork tw in wu.TypeWork)
+                        foreach (WorkUnit wu in batch.WorkUnits)
                         {
-                            totalZones += tw.Zones.Count;
-                            string prefabName = tw.Loc.m_prefabName;
-                            prefabZones.TryGetValue(prefabName, out int cur);
-                            prefabZones[prefabName] = cur + tw.Zones.Count;
+                            foreach (TypeRegionWork tw in wu.TypeWork)
+                            {
+                                totalZones += tw.Zones.Count;
+                                entryZones.TryGetValue(tw.Loc, out int cur);
+                                entryZones[tw.Loc] = cur + tw.Zones.Count;
+                            }
                         }
                     }
                 }
             }
             _parallelTotalZones = Math.Max(1, totalZones);
-            foreach (KeyValuePair<string, int> kvp in prefabZones)
+            foreach (KeyValuePair<ZoneLocation, int> kvp in entryZones)
             {
-                _totalZonesPerPrefab[kvp.Key] = kvp.Value;
+                _totalZonesPerEntry[kvp.Key] = kvp.Value;
             }
 
             /**
@@ -687,45 +726,19 @@ namespace LPA
                 List<OrderedEntry> entries = gtsMap[grpKey];
                 foreach (OrderedEntry entry in entries)
                 {
-                    string prefabName = entry.Loc.m_prefabName;
-                    if (_inFlightRegions[prefabName].Value > 0)
+                    if (_inFlightRegions[entry.Loc].Value > 0)
                     {
                         continue;
                     }
 
-                    _inFlightRegions[prefabName] = new StrongBox<int>(1);
+                    _inFlightRegions[entry.Loc] = new StrongBox<int>(1);
 
                     PlacementCounters sentinelCtr = new PlacementCounters();
                     TelemetryContext sentinelTel = new TelemetryContext();
-                    _counterLists[prefabName].Add(sentinelCtr);
-                    _telemetryLists[prefabName].Add(sentinelTel);
-
-                    string grp = entry.Loc.m_prefabName;
-                    if (!string.IsNullOrEmpty(entry.Loc.m_group))
-                    {
-                        grp = entry.Loc.m_group;
-                    }
-                    PresenceGrid grid = PresenceGrid.GetOrCreate(
-                        $"{grp}:{entry.Loc.m_minDistanceFromSimilar:F0}");
+                    _counterLists[entry.Loc].Add(sentinelCtr);
+                    _telemetryLists[entry.Loc].Add(sentinelTel);
 
                     //I have to say this looks horrible...
-                    WorkUnit sentinelWu = new WorkUnit
-                    {
-                        TypeWork = new List<TypeRegionWork>
-                        {
-                            new TypeRegionWork
-                            {
-                                Loc = entry.Loc,
-                                Group = grp,
-                                Grid = grid,
-                                Zones = new List<Vector2i>(),
-                                Counters = sentinelCtr,
-                                TelCtx = sentinelTel
-                            }
-                        },
-                        IsPrioritized = entry.Loc.m_prioritized
-                    };
-
                     GtsStream targetStream = null;
                     for (int i = 0; i < streams.Count; i++)
                     {
@@ -735,14 +748,288 @@ namespace LPA
                             break;
                         }
                     }
+
+                    WorkUnit sentinelWu = new WorkUnit
+                    {
+                        TypeWork = new List<TypeRegionWork>
+                        {
+                            new TypeRegionWork
+                            {
+                                Loc = entry.Loc,
+                                Memberships = ResolveSimilarityMemberships(entry.Loc),
+                                MaxAdvertise = ResolveMaxAdvertiseMemberships(entry.Loc),
+                                MaxSearch = ResolveMaxSearchMemberships(entry.Loc),
+                                Zones = new List<Vector2i>(),
+                                Counters = sentinelCtr,
+                                TelCtx = sentinelTel
+                            }
+                        },
+                        IsPrioritized = entry.Loc.m_prioritized,
+                        OwnerStream = targetStream
+                    };
+
                     if (targetStream != null && targetStream.SubGroups.Count > 0)
                     {
-                        targetStream.SubGroups[0].WorkUnits.Enqueue(sentinelWu);
+                        if (targetStream.SubGroups[0].Colors.Count > 0)
+                        {
+                            targetStream.SubGroups[0].Colors[0].WorkUnits.Add(sentinelWu);
+                        }
+                        else
+                        {
+                            ColorBatch dummyBatch = new ColorBatch();
+                            dummyBatch.WorkUnits = new List<WorkUnit>();
+                            dummyBatch.WorkUnits.Add(sentinelWu);
+                            targetStream.SubGroups[0].Colors.Add(dummyBatch);
+                        }
                     }
                 }
             }
 
             return streams;
+        }
+
+        /**
+        * Dispatches exactly one anchor tier and does not return until every entry in it has fully completed, inline
+        * relaxation included (that runs synchronously on the finishing worker inside DoFlushAndRelax). RunParallelPath calls
+        * this once per tier in ascending order, so a lower tier's advertise footprints are all committed before any searcher
+        * in a higher tier reads a grid.
+        *
+        * Within a tier the schedule is exactly what it always was: prioritized streams drain first, the priority barrier
+        * opens, then the rest, with the graph-coloring color barriers untouched. I reset the priority barrier per tier, which
+        * is safe only because the inter-tier barrier below guarantees no worker from the previous tier is still running.
+        *
+        * The inter-tier barrier is _tierDone: WorkerBody decrements _tierRemaining once per entry at its single completion
+        * point, and the last entry sets _tierDone. Workers stay alive across tiers because RunParallelPath withholds
+        * CompleteAdding until the final tier - between tiers they simply block in GetConsumingEnumerable.
+        */
+        private static IEnumerator DispatchOneTier(ZoneSystem zsP, List<OrderedEntry> tierEntriesP, Stopwatch yieldSwP)
+        {
+            _prioritizedInFlight = 0;
+            for (int i = 0; i < tierEntriesP.Count; i++)
+            {
+                if (tierEntriesP[i].Loc.m_prioritized)
+                {
+                    _prioritizedInFlight++;
+                }
+            }
+            _priorityBarrierDone.Reset();
+            if (_prioritizedInFlight == 0)
+            {
+                _priorityBarrierDone.Set();
+            }
+
+            _tierRemaining = tierEntriesP.Count;
+            _tierDone.Reset();
+
+            List<GtsStream> gtsStreams = BuildSpatialStreams(tierEntriesP);
+
+            // yieldSw is threaded through from RunParallelPath so frame pacing stays continuous across tiers. I alias it to the name the extracted dispatch body already uses.
+            Stopwatch yieldSw = yieldSwP;
+            bool crossedPriority = false;
+            const long YieldIntervalMs = 100;
+
+            if (_interleavedScheduling)
+            {
+                // Phase 1: round-robin prioritized streams until exhausted.
+                bool anyPrio = true;
+                while (anyPrio)
+                {
+                    anyPrio = false;
+                    bool enqueuedAnything = false;
+                    foreach (GtsStream stream in gtsStreams)
+                    {
+                        if (!stream.IsPrioritized)
+                        {
+                            continue;
+                        }
+
+                        // Wait for this stream's current color to finish completely before pushing the next color.
+                        if (Volatile.Read(ref stream.InFlightWorkUnits) > 0)
+                        {
+                            anyPrio = true;
+                            continue;
+                        }
+
+                        if (stream.CurrentSubGroup >= stream.SubGroups.Count)
+                        {
+                            continue;
+                        }
+
+                        SubGroupStream csg = stream.SubGroups[stream.CurrentSubGroup];
+                        if (csg.CurrentColorIndex >= csg.Colors.Count)
+                        {
+                            stream.CurrentSubGroup++;
+                            if (stream.CurrentSubGroup < stream.SubGroups.Count)
+                            {
+                                anyPrio = true;
+                            }
+                            continue;
+                        }
+
+                        // Enqueue ALL blocks (WorkUnits) for this specific Color!
+                        // Since they share a color, they are spatially isolated and safe for concurrent processing.
+                        ColorBatch batch = csg.Colors[csg.CurrentColorIndex];
+                        for (int w = 0; w < batch.WorkUnits.Count; w++)
+                        {
+                            _workQueue.Add(batch.WorkUnits[w]);
+                            Interlocked.Increment(ref stream.InFlightWorkUnits);
+                        }
+
+                        csg.CurrentColorIndex++;
+                        anyPrio = true;
+                        enqueuedAnything = true;
+                    }
+
+                    DrainAndCommit(zsP);
+                    UpdateAnnulus(zsP);
+                    if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs || (!enqueuedAnything && anyPrio))
+                    {
+                        yieldSw.Restart();
+                        yield return null;
+                    }
+                }
+
+                // Wait for the priority barrier before feeding non-prioritized work.
+                while (!_priorityBarrierDone.IsSet)
+                {
+                    DrainAndCommit(zsP);
+                    UpdateAnnulus(zsP);
+                    if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs)
+                    {
+                        yieldSw.Restart();
+                        yield return null;
+                    }
+                }
+
+                // Phase 2: round-robin non-prioritized streams.
+                bool anyLeft = true;
+                while (anyLeft)
+                {
+                    anyLeft = false;
+                    bool enqueuedAnything = false;
+                    foreach (GtsStream stream in gtsStreams)
+                    {
+                        if (stream.IsPrioritized)
+                        {
+                            continue;
+                        }
+
+                        if (Volatile.Read(ref stream.InFlightWorkUnits) > 0)
+                        {
+                            anyLeft = true;
+                            continue;
+                        }
+
+                        if (stream.CurrentSubGroup >= stream.SubGroups.Count)
+                        {
+                            continue;
+                        }
+
+                        SubGroupStream csg = stream.SubGroups[stream.CurrentSubGroup];
+                        if (csg.CurrentColorIndex >= csg.Colors.Count)
+                        {
+                            stream.CurrentSubGroup++;
+                            if (stream.CurrentSubGroup < stream.SubGroups.Count)
+                            {
+                                anyLeft = true;
+                            }
+                            continue;
+                        }
+
+                        ColorBatch batch = csg.Colors[csg.CurrentColorIndex];
+                        for (int w = 0; w < batch.WorkUnits.Count; w++)
+                        {
+                            _workQueue.Add(batch.WorkUnits[w]);
+                            Interlocked.Increment(ref stream.InFlightWorkUnits);
+                        }
+
+                        csg.CurrentColorIndex++;
+                        anyLeft = true;
+                        enqueuedAnything = true;
+                    }
+
+                    DrainAndCommit(zsP);
+                    UpdateAnnulus(zsP);
+                    if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs || (!enqueuedAnything && anyLeft))
+                    {
+                        yieldSw.Restart();
+                        yield return null;
+                    }
+                }
+            }
+            else
+            {
+                // Non-interleaved: exhaust each stream completely before moving on.
+                foreach (GtsStream stream in gtsStreams)
+                {
+                    if (!crossedPriority && !stream.IsPrioritized)
+                    {
+                        crossedPriority = true;
+                        while (!_priorityBarrierDone.IsSet)
+                        {
+                            DrainAndCommit(zsP);
+                            UpdateAnnulus(zsP);
+                            if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs)
+                            {
+                                yieldSw.Restart();
+                                yield return null;
+                            }
+                        }
+                    }
+                    foreach (SubGroupStream sg in stream.SubGroups)
+                    {
+                        for (int c = 0; c < sg.Colors.Count; c++)
+                        {
+                            ColorBatch batch = sg.Colors[c];
+                            for (int w = 0; w < batch.WorkUnits.Count; w++)
+                            {
+                                _workQueue.Add(batch.WorkUnits[w]);
+                                Interlocked.Increment(ref stream.InFlightWorkUnits);
+                            }
+
+                            // Wait for this specific color batch to finish before pushing the next color.
+                            while (Volatile.Read(ref stream.InFlightWorkUnits) > 0)
+                            {
+                                DrainAndCommit(zsP);
+                                UpdateAnnulus(zsP);
+                                if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs)
+                                {
+                                    yieldSw.Restart();
+                                    yield return null;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Final wait for any straggler streams.
+                foreach (GtsStream stream in gtsStreams)
+                {
+                    while (Volatile.Read(ref stream.InFlightWorkUnits) > 0)
+                    {
+                        DrainAndCommit(zsP);
+                        UpdateAnnulus(zsP);
+                        if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs)
+                        {
+                            yieldSw.Restart();
+                            yield return null;
+                        }
+                    }
+                }
+            }
+
+            // Inter-tier barrier: hold here until every entry in this tier has completed (main pass plus any inline relaxation),
+            // so the next tier's searchers see a fully painted set of this tier's advertisers.
+            while (!_tierDone.IsSet)
+            {
+                DrainAndCommit(zsP);
+                UpdateAnnulus(zsP);
+                if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs)
+                {
+                    yieldSw.Restart();
+                    yield return null;
+                }
+            }
         }
 
         private static void WorkerBody(ZoneSystem zsP, int workerIdxP)
@@ -774,36 +1061,65 @@ namespace LPA
                         + prefab.GetStableHashCode()
                         + regionSalt);
 
-                    if (Volatile.Read(ref _remainingToPlace[prefab].Value) > 0)
+                    if (Volatile.Read(ref _remainingToPlace[tw.Loc].Value) > 0)
                     {
-                        EvaluateZoneList(tw, prefab);
+                        EvaluateZoneList(tw);
                     }
 
-                    int regionsLeft = Interlocked.Decrement(ref _inFlightRegions[prefab].Value);
+                    int regionsLeft = Interlocked.Decrement(ref _inFlightRegions[tw.Loc].Value);
 
                     if (regionsLeft == 0)
                     {
-                        DoFlushAndRelax(zsP, tw.Loc, unit.IsPrioritized, workerIdxP);
+                        /**
+                        * Pass and gate on the ENTRY's own priority flag, not unit.IsPrioritized (the stream's flag).
+                        * Priority and similarity groups are independent: a prioritized entry sharing a stream with a non-prioritized one would otherwise decrement
+                        * _prioritizedInFlight against a count it never contributed to, and vice versa. *sigh*
+                        */
+                        DoFlushAndRelax(zsP, tw.Loc, tw.Loc.m_prioritized, workerIdxP);
 
-                        if (unit.IsPrioritized)
+                        /**
+                        * Priority barrier first: this entry releases its slot in _prioritizedInFlight (and opens the priority
+                        * barrier if it was the last prioritized entry) BEFORE it signals tier completion below. Order matters -
+                        * the dispatcher resets _prioritizedInFlight and _priorityBarrierDone for the next tier the instant it
+                        * observes _tierDone, so every touch of those two by this tier's workers has to happen first.
+                        */  
+                        if (tw.Loc.m_prioritized)
                         {
                             if (Interlocked.Decrement(ref _prioritizedInFlight) == 0)
                             {
                                 _priorityBarrierDone.Set();
                             }
                         }
+
+                        /**
+                        * Inter-tier barrier LAST: every entry, prioritized or not, decrements the tier counter exactly once
+                        * here at its single completion point (inline relaxation already ran synchronously inside
+                        * DoFlushAndRelax, so a tier is not done until its relaxation is done too). The last entry to complete
+                        * sets _tierDone and releases the dispatcher, by which point all priority-state writes above are done.
+                        */
+                        if (Interlocked.Decrement(ref _tierRemaining) == 0)
+                        {
+                            _tierDone.Set();
+                        }
                     }
+                }
+
+                if (unit.OwnerStream != null)
+                {
+                    Interlocked.Decrement(ref unit.OwnerStream.InFlightWorkUnits);
                 }
 
                 GenerationProgress.SetThreadSlot(workerIdxP, null);
             }
         }
 
-        private static void EvaluateZoneList(TypeRegionWork twP, string prefabP)
+        private static void EvaluateZoneList(TypeRegionWork twP)
         {
             ZoneLocation loc = twP.Loc;
             PlacementCounters ctr = twP.Counters;
-            string group = twP.Group;
+            List<GroupMembership> memberships = twP.Memberships;
+            List<GroupMembership> maxAdvertise = twP.MaxAdvertise;
+            List<GroupMembership> maxSearch = twP.MaxSearch;
             int baseBudget = 100000;
             if (loc.m_prioritized)
             {
@@ -816,8 +1132,9 @@ namespace LPA
             * candidate lists include BoilingOcean zones for AshLands types
             * whose altitude range extends below -4m, so the biome mask must match.
             * NOTE (1.0.1): literal AshLands reference retained. This is geometry-specific
-            * (below-sea reclassification of vanilla AshLands zones) not a generic lava-biome
-            * check. Flagged for a future pass to generalize across EWD custom lava biomes.
+            * (below-sea reclassification of vanilla AshLands zones) not a generic lava-biome check. 
+            * Flagged for a future pass to generalize across EWD custom lava biomes. I had this comment somewhere else.
+            * I do not remember what lava biomes I was thinking of... gee zus..
             */
             long searchBiome = (long)(uint)(int)loc.m_biome;
             bool isAshLands = (searchBiome & (long)Heightmap.Biome.AshLands) != 0L;
@@ -840,7 +1157,7 @@ namespace LPA
                 {
                     break;
                 }
-                if (Volatile.Read(ref _remainingToPlace[prefabP].Value) <= 0)
+                if (Volatile.Read(ref _remainingToPlace[twP.Loc].Value) <= 0)
                 {
                     break;
                 }
@@ -862,30 +1179,31 @@ namespace LPA
                     zoneGridIdx = si;
                 }
 
-                if (EvaluateZoneParallel(loc, zoneID, zoneGridIdx, twP.Grid, group,
+                if (EvaluateZoneParallel(loc, zoneID, zoneGridIdx, memberships, maxSearch,
                                          ctr, twP.TelCtx, out Vector3 pos))
                 {
                     // Atomically claim a placement slot. If another worker beat us to filling the quota, undo and stop.
-                    if (Interlocked.Decrement(ref _remainingToPlace[prefabP].Value) < 0)
+                    if (Interlocked.Decrement(ref _remainingToPlace[twP.Loc].Value) < 0)
                     {
-                        Interlocked.Increment(ref _remainingToPlace[prefabP].Value);
+                        Interlocked.Increment(ref _remainingToPlace[twP.Loc].Value);
                         break;
                     }
 
                     // Atomically claim the zone. If another worker already placed here, undo the slot claim and continue to next zone.
                     if (!_pendingOccupancy.TryAdd(zoneID, 1))
                     {
-                        Interlocked.Increment(ref _remainingToPlace[prefabP].Value);
+                        Interlocked.Increment(ref _remainingToPlace[twP.Loc].Value);
                         ctr.ErrOccupied++;
                         continue;
                     }
 
-                    CommitToGroup(group, pos);
+                    CommitMemberships(memberships, pos);
+                    CommitMaxAdvertise(maxAdvertise, pos);
                     _resultQueue.Enqueue(new PlacementResult
                     {
                         Loc = loc,
                         Position = pos,
-                        Group = group,
+                        Group = loc.m_group,
                         ZoneIdx = zoneGridIdx,
                         ZoneID = zoneID,
                         Counters = ctr
@@ -897,10 +1215,10 @@ namespace LPA
             }
         }
 
-        private static PlacementCounters AggregateCounters(string prefabP)
+        private static PlacementCounters AggregateCounters(ZoneLocation entryP)
         {
             PlacementCounters agg = new PlacementCounters();
-            bool hasList = _counterLists.TryGetValue(prefabP, out List<PlacementCounters> list);
+            bool hasList = _counterLists.TryGetValue(entryP, out List<PlacementCounters> list);
             if (!hasList)
             {
                 return agg;
@@ -916,16 +1234,17 @@ namespace LPA
                 agg.ErrBiome += ctr.ErrBiome;
                 agg.ErrAlt += ctr.ErrAlt;
                 agg.ErrSim += ctr.ErrSim;
+                agg.ErrNotSim += ctr.ErrNotSim;
                 agg.ErrTerrain += ctr.ErrTerrain;
                 agg.ErrForest += ctr.ErrForest;
             }
             return agg;
         }
 
-        private static TelemetryContext AggregateTelemetry(string prefabP)
+        private static TelemetryContext AggregateTelemetry(ZoneLocation entryP)
         {
             TelemetryContext merged = new TelemetryContext();
-            bool hasList = _telemetryLists.TryGetValue(prefabP, out List<TelemetryContext> list);
+            bool hasList = _telemetryLists.TryGetValue(entryP, out List<TelemetryContext> list);
             if (hasList)
             {
                 foreach (TelemetryContext tc in list)
@@ -940,9 +1259,11 @@ namespace LPA
             ZoneSystem zsP, ZoneLocation locP, bool isPrioritizedP, int workerIdxP)
         {
             string prefab = locP.m_prefabName;
+            // Relaxation state is keyed per logical type (clones are distinct types), prefab stays for the center-first count, the PlayabilityPolicy config lookup, and AggregateSessions.
+            string typeKey = Interleaver.GetTypeKey(locP);
 
-            PlacementCounters ctr = AggregateCounters(prefab);
-            TelemetryContext telCtx = AggregateTelemetry(prefab);
+            PlacementCounters ctr = AggregateCounters(locP);
+            TelemetryContext telCtx = AggregateTelemetry(locP);
 
             int cfCount = 0;
             if (_centerFirstCounts.TryGetValue(prefab, out int cfc))
@@ -950,15 +1271,17 @@ namespace LPA
                 cfCount = cfc;
             }
             int globalPlaced = ctr.Placed + cfCount;
-            int origQty = Interleaver.GetOriginalQuantity(prefab);
+            // The entry's own m_quantity IS its target here. i.e. the parallel path runs off OriginalLocations (un-packetized), and relaxation never mutates m_quantity on the original entry.
+            // GetOriginalQuantity(prefab) would return the FIRST prefab match, conflating clones, so it is wrong for any clone past the first.
+            int origQty = locP.m_quantity;
             bool isComplete = globalPlaced >= origQty;
             int minNeeded = PlayabilityPolicy.GetMinimumNeededCount(prefab, origQty);
-            bool wasRelaxed = ConstraintRelaxer.RelaxationAttempts.TryGetValue(prefab, out int relaxCount) && relaxCount > 0;
+            bool wasRelaxed = ConstraintRelaxer.RelaxationAttempts.TryGetValue(typeKey, out int relaxCount) && relaxCount > 0;
             bool isSuccess = isComplete || (wasRelaxed && globalPlaced >= minNeeded);
 
             // Credit unexamined zones to the annulus progress so it stays smooth when a type fills its quota early and leaves zones unvisited.
             int totalZonesForType = 0;
-            if (_totalZonesPerPrefab.TryGetValue(prefab, out int tz))
+            if (_totalZonesPerEntry.TryGetValue(locP, out int tz))
             {
                 totalZonesForType = tz;
             }
@@ -988,7 +1311,7 @@ namespace LPA
 
             if (isSuccess && wasRelaxed)
             {
-                RelaxationTracker.MarkRelaxationSucceeded(prefab);
+                RelaxationTracker.MarkRelaxationSucceeded(typeKey);
             }
 
             if (!_minimalLogging)
@@ -1022,7 +1345,7 @@ namespace LPA
                     int snap = zsP.m_locations.Count;
                     if (!ConstraintRelaxer.TryRelax(data))
                     {
-                        RelaxationTracker.CheckAndMarkFailed(prefab, globalPlaced, origQty, locP.m_prioritized);
+                        RelaxationTracker.CheckAndMarkFailed(typeKey, globalPlaced, origQty, locP.m_prioritized);
                     }
                     else if (zsP.m_locations.Count > snap)
                     {
@@ -1056,8 +1379,7 @@ namespace LPA
         }
 
         /**
-        * Inline relaxation on a worker thread. Uses GetZone for zone iteration
-        * since relaxation is single-threaded (one worker owns the failed type, basically the one who happened to realize the failure)
+        * Inline relaxation on a worker thread. Uses GetZone for zone iteration  since relaxation is single-threaded (one worker owns the failed type, basically the one who happened to realize the failure)
         * and the original candidate cache is untouched (parallel path used copies). Can cascade recursively if further relaxation attempts are needed.
         */
         private static void RunInlineRelaxation(
@@ -1065,21 +1387,18 @@ namespace LPA
             int priorPlacedP, int origQtyP, int minNeededP, int cfCountP)
         {
             string prefab = relaxLocP.m_prefabName;
+            string typeKey = Interleaver.GetTypeKey(relaxLocP);
             int attemptNum = 1;
-            if (ConstraintRelaxer.RelaxationAttempts.TryGetValue(prefab, out int ac))
+            if (ConstraintRelaxer.RelaxationAttempts.TryGetValue(typeKey, out int ac))
             {
                 attemptNum = ac;
             }
             GenerationProgress.SetThreadSlot(workerIdxP,
                 $"{prefab}  (Relaxation attempt {attemptNum})");
 
-            string group = relaxLocP.m_prefabName;
-            if (!string.IsNullOrEmpty(relaxLocP.m_group))
-            {
-                group = relaxLocP.m_group;
-            }
-            PresenceGrid grid = PresenceGrid.GetOrCreate(
-                $"{group}:{relaxLocP.m_minDistanceFromSimilar:F0}");
+            List<GroupMembership> memberships = ResolveSimilarityMemberships(relaxLocP);
+            List<GroupMembership> maxAdvertise = ResolveMaxAdvertiseMemberships(relaxLocP);
+            List<GroupMembership> maxSearch = ResolveMaxSearchMemberships(relaxLocP);
             int budget = _outerBudgetBase;
             if (relaxLocP.m_prioritized)
             {
@@ -1119,7 +1438,7 @@ namespace LPA
                         relaxZoneGridIdx = rsi;
                     }
 
-                    if (EvaluateZoneParallel(relaxLocP, zoneID, relaxZoneGridIdx, grid, group,
+                    if (EvaluateZoneParallel(relaxLocP, zoneID, relaxZoneGridIdx, memberships, maxSearch,
                                              relaxCtr, relaxTel, out Vector3 pos))
                     {
                         if (!_pendingOccupancy.TryAdd(zoneID, 1))
@@ -1128,12 +1447,13 @@ namespace LPA
                             continue;
                         }
 
-                        CommitToGroup(group, pos);
+                        CommitMemberships(memberships, pos);
+                        CommitMaxAdvertise(maxAdvertise, pos);
                         _resultQueue.Enqueue(new PlacementResult
                         {
                             Loc = relaxLocP,
                             Position = pos,
-                            Group = group,
+                            Group = relaxLocP.m_group,
                             ZoneIdx = relaxZoneGridIdx,
                             ZoneID = zoneID,
                             Counters = relaxCtr
@@ -1156,14 +1476,10 @@ namespace LPA
             int relaxGlobalPlaced = priorPlacedP + relaxCtr.Placed;
 
             /**
-            * Register relaxCtr so any subsequent DoFlushAndRelax call for this prefab
-            * (from a later-finishing work unit) sees the correct globalPlaced and doesn't re-trigger TryRelax.
+            * Under the per-entry rekey there is no longer a "subsequent DoFlushAndRelax for this prefab" to feed as each entry owns its _inFlightRegions counter and flushes exactly once,
+            * and this relaxation's outcome is reported inline below. relaxCtr therefore does not need to be parked back into _counterLists (the parent entry already flushed), so the old
+            * prefab-keyed registration is gone. Keeping it would also have mis-credited a clone that happens to share this prefab. I will not remember any of this pre EWD 1.66 by September anyway.
             */
-            bool hasCounterList = _counterLists.TryGetValue(prefab, out List<PlacementCounters> ctrList);
-            if (hasCounterList)
-            {
-                ctrList.Add(relaxCtr);
-            }
 
             lock (TranspiledCompletionHandler.AggregateSessions)
             {
@@ -1171,7 +1487,7 @@ namespace LPA
             }
 
             bool relaxIsSuccess = relaxGlobalPlaced >= origQtyP
-                || (ConstraintRelaxer.RelaxationAttempts.TryGetValue(prefab, out int rc2) && rc2 > 0
+                || (ConstraintRelaxer.RelaxationAttempts.TryGetValue(typeKey, out int rc2) && rc2 > 0
                     && relaxGlobalPlaced >= minNeededP);
 
             int relaxDisplayQty = origQtyP;
@@ -1184,11 +1500,11 @@ namespace LPA
 
             if (relaxIsSuccess)
             {
-                RelaxationTracker.MarkRelaxationSucceeded(prefab);
+                RelaxationTracker.MarkRelaxationSucceeded(typeKey);
                 if (!_minimalLogging)
                 {
                     int rc3 = 0;
-                    if (ConstraintRelaxer.RelaxationAttempts.TryGetValue(prefab, out int r3))
+                    if (ConstraintRelaxer.RelaxationAttempts.TryGetValue(typeKey, out int r3))
                     {
                         rc3 = r3;
                     }
@@ -1213,7 +1529,7 @@ namespace LPA
                     int snap2 = zsP.m_locations.Count;
                     if (!ConstraintRelaxer.TryRelax(relaxData))
                     {
-                        RelaxationTracker.CheckAndMarkFailed(prefab, relaxGlobalPlaced, origQtyP, relaxLocP.m_prioritized);
+                        RelaxationTracker.CheckAndMarkFailed(typeKey, relaxGlobalPlaced, origQtyP, relaxLocP.m_prioritized);
                     }
                     else if (zsP.m_locations.Count > snap2)
                     {
@@ -1244,15 +1560,13 @@ namespace LPA
         }
 
         /**
-        * Thread-safe dart evaluation - identical filter chain to EvaluateZone
-        * but uses ThreadSafePRNG instead of UnityEngine.Random.
-        * Does NOT call RegisterLocation (main-thread-only). Instead, returns
-        * the position via out parameter for the caller to enqueue into _resultQueue.
-        * PIA god method. Could not be helped. 
+        * Thread-safe dart evaluation with identical filter chain to EvaluateZone but uses ThreadSafePRNG instead of UnityEngine.Random.
+        * Does NOT call RegisterLocation (main-thread-only). Instead, returns the position via out parameter for the caller to enqueue into _resultQueue.
+        * PIA god method. Could not be helped. Maybe it could. 
         */
         private static bool EvaluateZoneParallel(
             ZoneLocation locP, Vector2i zoneIDP, int zoneGridIdxP,
-            PresenceGrid groupGridP, string groupP,
+            List<GroupMembership> membershipsP, List<GroupMembership> maxSearchP,
             PlacementCounters ctrP, TelemetryContext telCtxP,
             out Vector3 position)
         {
@@ -1299,14 +1613,16 @@ namespace LPA
                     continue;
                 }
 
-                if (locP.m_minDistanceFromSimilar > 0f && groupGridP.HasConflict(p))
+                if (ConflictsWithSimilarMembers(p, membershipsP, dartBiome, _occupancySnapshot))
                 {
-                    if (!_enable3DSimilarity || !IsHighRelief(dartBiome) ||
-                        Confirm3DSimilarityConflict(p, locP.m_minDistanceFromSimilar, groupP, _occupancySnapshot))
-                    {
-                        ctrP.ErrSim++;
-                        continue;
-                    }
+                    ctrP.ErrSim++;
+                    continue;
+                }
+
+                if (!SatisfiesMaxSearch(p, maxSearchP, dartBiome, _occupancySnapshot))
+                {
+                    ctrP.ErrNotSim++;
+                    continue;
                 }
 
                 if (locP.m_maxTerrainDelta > 0f || locP.m_minTerrainDelta > 0f)
@@ -1349,6 +1665,13 @@ namespace LPA
             }
         }
 
+        /**
+         * Prioritized locations sort first ( again vanilla behaviour and what I was doing).
+         * Then as I said somewhere previously, within the same priority tier, modded locations (MWL_ prefix and later others I should add) sort after vanilla types so vanilla fills its quotas first.
+         * I then sort by descending exclusion radius so Landlords (huge radius) place before Tenants (small radius) for the crazy yamls that set everything prioritized breaking my elegant assumption that
+         * landlords are prioritized and would be placed first. *angry dome visit*
+         * Finally, I use the original list index to guarantee the sort is stable which I should be doing anyway.
+         */
         private static int CompareOrderedEntries(OrderedEntry aP, OrderedEntry bP)
         {
             if (aP.Loc.m_prioritized != bP.Loc.m_prioritized)
@@ -1371,7 +1694,12 @@ namespace LPA
                 return -1;
             }
 
-            return 0;
+            if (aP.Loc.m_minDistanceFromSimilar != bP.Loc.m_minDistanceFromSimilar)
+            {
+                return bP.Loc.m_minDistanceFromSimilar.CompareTo(aP.Loc.m_minDistanceFromSimilar);
+            }
+
+            return aP.OriginalIndex.CompareTo(bP.OriginalIndex);
         }
 
         private static void UpdateAnnulus(ZoneSystem zsP)

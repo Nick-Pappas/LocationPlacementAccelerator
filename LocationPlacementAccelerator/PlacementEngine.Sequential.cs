@@ -1,4 +1,4 @@
-// v1.2
+// v1.6
 /**
 * Sequential (single-threaded) placement path for the replaced engine.
 *
@@ -25,6 +25,29 @@
 * relax-quantity restore) are  inside EndGeneration itself.
 * The * overlay teardown and summary log run in both paths now and 
 * I am not left with the GUI staring at me.
+*
+* 1.3: Multi-group similarity as per 1.64 EWD. Each of the three EvaluateZone sites used to build a
+* single (group, radius) grid off m_group-or-prefab and hand it in. They now resolve the location's full membership list 
+* via ResolveSimilarityMemberships (Core), so a multi-group location is checked against, and commits into, 
+* every real group it belongs to. Single-group and ungrouped locations resolve to a one-element list, so this path is unchanged for them.
+*
+* 1.4: Per-token accounting keyed on the logical type key (Interleaver.GetTypeKey). 
+* Distinct  EWD clones share a prefab but are different types, so nativeCounters, the per-type RNG isolation (ltsRngStates + the InitState seed), 
+* the pendingPackets bookkeeping, and the relaxation pass's relaxCtrs/relaxRepLoc (and its seed) all key per type, otherwise a second
+* clone's packet would read the first's pending count and share its counter. 
+* The seed deriving from the type key decorrelates clone dart sequences while leaving non-clone worlds bit-identical
+* (the type key equals the prefab name there). AggregateSessions stays prefab-keyed (for the telemetry).
+*
+* 1.5: Each of the three EvaluateZone sites now also resolves the location's max advertise and search membership
+* sets (Core.ResolveMaxAdvertise/SearchMemberships) and hands them in, so the sequential path enforces
+* maxDistanceFromSimilar / anchors identically to Core. Ordinary and single-group locations resolve to empty max
+* sets, so this path is unchanged for them.
+* 
+* 1.6: The relaxation pass now runs tier by tier. A host that only succeeds during relaxation still has to be placed
+* before its satellites retry, otherwise a satellite relaxes against a grid the host has not painted yet and fails for
+* no real reason. I bucket the appended relaxation entries by anchor tier and process low tiers first, keeping append
+* order within a tier so the pass stays deterministic. Tier ordering of the main pass itself lives in the sequential
+* sort (Core.CompareSequentialSortEntries), this covers only the relaxation tail.
 */
 #nullable disable
 using System;
@@ -61,44 +84,50 @@ namespace LPA
             {
                 PlacementToken token = tokens[ti];
                 ZoneLocation loc = token.Location;
+                /**
+                 * Sp per logical type: distinct clones sharing a prefab get their own counter, RNG isolation, and packet bookkeeping. 
+                 * A packet inherits its origin's type key, so all packets of one type group together. 
+                 * AggregateSessions again stays prefab-keyed for the telemetry.
+                */
+                string typeKey = Interleaver.GetTypeKey(loc);
 
-                bool hasCounter = nativeCounters.TryGetValue(loc.m_prefabName, out PlacementCounters ctr);
+                bool hasCounter = nativeCounters.TryGetValue(typeKey, out PlacementCounters ctr);
                 if (!hasCounter)
                 {
                     ctr = new PlacementCounters();
-                    nativeCounters[loc.m_prefabName] = ctr;
+                    nativeCounters[typeKey] = ctr;
                 }
 
-                bool isFirstTokenForThisPrefab = !_rngIsolationActive;
+                bool isFirstTokenForThisType = !_rngIsolationActive;
                 if (_interleavedScheduling)
                 {
-                    isFirstTokenForThisPrefab = !ltsRngStates.ContainsKey(loc.m_prefabName);
+                    isFirstTokenForThisType = !ltsRngStates.ContainsKey(typeKey);
                 }
 
                 if (_interleavedScheduling)
                 {
-                    if (isFirstTokenForThisPrefab)
+                    if (isFirstTokenForThisType)
                     {
                         _outsideRngState = UnityEngine.Random.state;
-                        int ltsSeed = WorldGenerator.instance.GetSeed() + loc.m_prefabName.GetStableHashCode();
+                        int ltsSeed = WorldGenerator.instance.GetSeed() + typeKey.GetStableHashCode();
                         UnityEngine.Random.InitState(ltsSeed);
                     }
                     else
                     {
-                        ltsRngStates.TryGetValue(loc.m_prefabName, out UnityEngine.Random.State savedState);
+                        ltsRngStates.TryGetValue(typeKey, out UnityEngine.Random.State savedState);
                         UnityEngine.Random.state = savedState;
                     }
                     _rngIsolationActive = true;
                 }
-                else if (isFirstTokenForThisPrefab)
+                else if (isFirstTokenForThisType)
                 {
                     _outsideRngState = UnityEngine.Random.state;
-                    int ltsSeed = WorldGenerator.instance.GetSeed() + loc.m_prefabName.GetStableHashCode();
+                    int ltsSeed = WorldGenerator.instance.GetSeed() + typeKey.GetStableHashCode();
                     UnityEngine.Random.InitState(ltsSeed);
                     _rngIsolationActive = true;
                 }
 
-                if (isFirstTokenForThisPrefab)
+                if (isFirstTokenForThisType)
                 {
                     if (_logSuccesses || ModConfig.DiagnosticMode.Value)
                     {
@@ -113,12 +142,9 @@ namespace LPA
 
                 GenerationProgress.CurrentLocation = loc;
 
-                string group = loc.m_prefabName;
-                if (!string.IsNullOrEmpty(loc.m_group))
-                {
-                    group = loc.m_group;
-                }
-                PresenceGrid groupGrid = PresenceGrid.GetOrCreate($"{group}:{loc.m_minDistanceFromSimilar:F0}");
+                List<GroupMembership> memberships = ResolveSimilarityMemberships(loc);
+                List<GroupMembership> maxAdvertise = ResolveMaxAdvertiseMemberships(loc);
+                List<GroupMembership> maxSearch = ResolveMaxSearchMemberships(loc);
                 int baseBudget = 100000;
                 if (loc.m_prioritized)
                 {
@@ -163,14 +189,14 @@ namespace LPA
                         continue;
                     }
 
-                    placed = EvaluateZone(zsP, loc, zoneID, groupGrid, group, ctr, telCtx);
+                    placed = EvaluateZone(zsP, loc, zoneID, memberships, maxAdvertise, maxSearch, ctr, telCtx);
 
                     if (++yieldCounter >= YieldEvery)
                     {
                         yieldCounter = 0;
                         if (_generateLocationsProgressField != null && tokens.Count > 0)
                         {
-                            _generateLocationsProgressField.SetValue(zsP, (float)(ti + 1) / tokens.Count);//ti is my for loop counter, 3km above.
+                            _generateLocationsProgressField.SetValue(zsP, (float)(ti + 1) / tokens.Count);//ti is my for loop counter, 3k lines above.
                         }
                         if (_rngIsolationActive)
                         {
@@ -197,25 +223,25 @@ namespace LPA
 
                 if (_interleavedScheduling && _rngIsolationActive)
                 {
-                    ltsRngStates[loc.m_prefabName] = UnityEngine.Random.state;
+                    ltsRngStates[typeKey] = UnityEngine.Random.state;
                 }
 
-                bool hasPending = pendingPackets.TryGetValue(loc.m_prefabName, out int remaining);
+                bool hasPending = pendingPackets.TryGetValue(typeKey, out int remaining);
                 if (hasPending)
                 {
                     remaining--;
-                    pendingPackets[loc.m_prefabName] = remaining;
+                    pendingPackets[typeKey] = remaining;
                     if (remaining <= 0)
                     {
-                        pendingPackets.Remove(loc.m_prefabName);
+                        pendingPackets.Remove(typeKey);
                         if (_rngIsolationActive)
                         {
                             UnityEngine.Random.state = _outsideRngState;
                             _rngIsolationActive = false;
                         }
-                        ltsRngStates.Remove(loc.m_prefabName);
+                        ltsRngStates.Remove(typeKey);
                         FlushLTS(zsP, loc, ctr);
-                        nativeCounters.Remove(loc.m_prefabName);
+                        nativeCounters.Remove(typeKey);
                     }
                 }
             }
@@ -226,7 +252,7 @@ namespace LPA
                 ZoneLocation remainingLoc = null;
                 for (int i = 0; i < zsP.m_locations.Count; i++)
                 {
-                    if (zsP.m_locations[i].m_prefabName == kvp.Key)
+                    if (Interleaver.GetTypeKey(zsP.m_locations[i]) == kvp.Key)
                     {
                         remainingLoc = zsP.m_locations[i];
                         break;
@@ -251,6 +277,36 @@ namespace LPA
                 List<ZoneLocation> relaxLocs = zsP.m_locations.GetRange(locListSnapshotP, newCount);
                 locListSnapshotP = zsP.m_locations.Count;
 
+                /**
+                * Relaxation must respect tiers as well: a host that only recovers here has to be placed before its satellites
+                * retry, or the satellites relax against a grid the host has not painted. I bucket the appended entries by tier
+                * and walk low tiers first, preserving append order within a tier so the pass is deterministic.
+                */ 
+                int maxRelaxTier = 0;
+                for (int ri = 0; ri < relaxLocs.Count; ri++)
+                {
+                    int rt = TierOf(relaxLocs[ri]);
+                    if (rt > maxRelaxTier)
+                    {
+                        maxRelaxTier = rt;
+                    }
+                }
+                if (maxRelaxTier > 0)
+                {
+                    List<ZoneLocation> tierOrdered = new List<ZoneLocation>(relaxLocs.Count);
+                    for (int rtier = 0; rtier <= maxRelaxTier; rtier++)
+                    {
+                        for (int ri = 0; ri < relaxLocs.Count; ri++)
+                        {
+                            if (TierOf(relaxLocs[ri]) == rtier)
+                            {
+                                tierOrdered.Add(relaxLocs[ri]);
+                            }
+                        }
+                    }
+                    relaxLocs = tierOrdered;
+                }
+
                 DiagnosticLog.WriteTimestampedLog(
                     $"[LPA] Relaxation pass {relaxPass + 1}: processing {newCount} relaxed packet(s).");
 
@@ -264,25 +320,25 @@ namespace LPA
                         continue;
                     }
                     string prefabName = relaxLoc.m_prefabName;
-                    bool hasRelaxCtr = relaxCtrs.ContainsKey(prefabName);
+                    // Relaxation counters/representative and the RNG seed are per logical type now.
+                    // AggregateSessions (the telemetry) stays prefab-keyed. A relaxation packet inherits its origin's type key, so a single relaxation's packets share one counter.
+                    string typeKey = Interleaver.GetTypeKey(relaxLoc);
+                    bool hasRelaxCtr = relaxCtrs.ContainsKey(typeKey);
                     if (!hasRelaxCtr)
                     {
-                        relaxCtrs[prefabName] = new PlacementCounters();
-                        relaxRepLoc[prefabName] = relaxLoc;
+                        relaxCtrs[typeKey] = new PlacementCounters();
+                        relaxRepLoc[typeKey] = relaxLoc;
                         bool hasSession = TranspiledCompletionHandler.AggregateSessions.ContainsKey(prefabName);
                         if (!hasSession)
                         {
                             TranspiledCompletionHandler.AggregateSessions[prefabName] = new TelemetryContext();
                         }
                     }
-                    PlacementCounters relaxCtr = relaxCtrs[prefabName];
+                    PlacementCounters relaxCtr = relaxCtrs[typeKey];
 
-                    string relaxGroup = prefabName;
-                    if (!string.IsNullOrEmpty(relaxLoc.m_group))
-                    {
-                        relaxGroup = relaxLoc.m_group;
-                    }
-                    PresenceGrid relaxGrid = PresenceGrid.GetOrCreate($"{relaxGroup}:{relaxLoc.m_minDistanceFromSimilar:F0}");
+                    List<GroupMembership> relaxMemberships = ResolveSimilarityMemberships(relaxLoc);
+                    List<GroupMembership> relaxMaxAdvertise = ResolveMaxAdvertiseMemberships(relaxLoc);
+                    List<GroupMembership> relaxMaxSearch = ResolveMaxSearchMemberships(relaxLoc);
                     int relaxOuterBudget = _outerBudgetBase;
                     if (relaxLoc.m_prioritized)
                     {
@@ -296,7 +352,7 @@ namespace LPA
                     }
 
                     _outsideRngState = UnityEngine.Random.state;
-                    int relaxSeed = WorldGenerator.instance.GetSeed() + prefabName.GetStableHashCode();
+                    int relaxSeed = WorldGenerator.instance.GetSeed() + typeKey.GetStableHashCode();
                     UnityEngine.Random.InitState(relaxSeed);
                     _rngIsolationActive = true;
 
@@ -338,7 +394,7 @@ namespace LPA
                                 continue;
                             }
 
-                            placed = EvaluateZone(zsP, relaxLoc, zoneID, relaxGrid, relaxGroup, relaxCtr, relaxTelCtx);
+                            placed = EvaluateZone(zsP, relaxLoc, zoneID, relaxMemberships, relaxMaxAdvertise, relaxMaxSearch, relaxCtr, relaxTelCtx);
 
                             if (++yieldCounter >= YieldEvery)
                             {
@@ -412,13 +468,10 @@ namespace LPA
                 TranspiledCompletionHandler.AggregateSessions[locP.m_prefabName] = new TelemetryContext();
             }
 
-            string group = locP.m_prefabName;
-            if (!string.IsNullOrEmpty(locP.m_group))
-            {
-                group = locP.m_group;
-            }
-            PresenceGrid groupGrid = PresenceGrid.GetOrCreate($"{group}:{locP.m_minDistanceFromSimilar:F0}");
-            int baseBudget = 100000;
+            List<GroupMembership> memberships = ResolveSimilarityMemberships(locP);
+            List<GroupMembership> maxAdvertise = ResolveMaxAdvertiseMemberships(locP);
+            List<GroupMembership> maxSearch = ResolveMaxSearchMemberships(locP);
+            int baseBudget = 100000;//ffs I still have these things hardcoded everywhere.
             if (locP.m_prioritized)
             {
                 baseBudget = 200000;
@@ -442,7 +495,7 @@ namespace LPA
             const int YieldEvery = 512;
 
             _outsideRngState = UnityEngine.Random.state;
-            int ltsSeed = WorldGenerator.instance.GetSeed() + locP.m_prefabName.GetStableHashCode();
+            int ltsSeed = WorldGenerator.instance.GetSeed() + Interleaver.GetTypeKey(locP).GetStableHashCode();
             UnityEngine.Random.InitState(ltsSeed);
             _rngIsolationActive = true;
 
@@ -481,7 +534,7 @@ namespace LPA
                         continue;
                     }
 
-                    placed = EvaluateZone(zsP, locP, zoneID, groupGrid, group, ctrP, telCtx);
+                    placed = EvaluateZone(zsP, locP, zoneID, memberships, maxAdvertise, maxSearch, ctrP, telCtx);
 
                     if (++yieldCounter >= YieldEvery)
                     {

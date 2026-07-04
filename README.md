@@ -3,19 +3,28 @@
 
 # Location Placement Accelerator (LPA)
   
-  For a separate readme describing the config options check the [github](https://github.com/Nick-Pappas/LocationPlacementAccelerator/blob/master/README%20for%20config.md). In fact I HIGHLY recommend it. 
+For a separate readme describing the config options check the [github](https://github.com/Nick-Pappas/LocationPlacementAccelerator/blob/master/README%20for%20config.md). In fact I highly recommend it. 
+
+[Here is a video that describes what this mod does and why Mr. Bean needed it.](https://www.youtube.com/watch?v=s8BDY6KSVjg)
+
+Alas, we have all been there.
+
+The mini tutorial in the video is from 6m to 8m or so.
+
+--------------
 
 LPA is a complete overhaul of Valheim's location placement engine, originally built to solve the massive generation times and broken unplayable worlds caused by using mods like **[Better Continents](https://thunderstore.io/c/valheim/p/JereKuusela/BetterContinents/)** and **[Expand World Size](https://thunderstore.io/c/valheim/p/JereKuusela/Expand_World_Size/)** combined with mods that add locations. Better Continents (BC hereafter) can generate incredible geology and topology and Expand World Size (EWS) can generate vast worlds, but often you cannot play in those worlds because vital locations fail to be placed during generation, and it takes forever to generate those worlds too.
+The same goes for Riverheim.
   
 
-When you use custom terrain noise, massive map radii, and hundreds of modded points of interest, Valheim's vanilla "guess-and-check" placement algorithm breaks down. A heavily modded game can take 30 minutes to generate a world, only to leave you with an unplayable map missing half its bosses or having no Hildir and so on.
+When you use custom terrain noise, massive map radii, and hundreds of modded points of interest, Valheim's vanilla "guess-and-check" placement algorithm breaks down. A heavily modded game can take 30-40+ minutes to generate a world, only to leave you with an unplayable map missing half its bosses or having no Hildir and so on.
  
 
 LPA can fix this by giving the placement algorithm "eyes" (pre-scanning the world topology) and optionally (although on by default) utilizing all your CPU cores. 
 
-### **Note: LPA is only needed during world generation. Once your map is generated, the mod can be safely disabled or removed from your server/game. You do not need it unless you want to speed up the generation of another world.**
+### **Note: LPA is only needed during world generation. Once your map is generated, the mod can be safely disabled or removed from your server/game. You do not need it unless you want to speed up the generation of another world or use genloc or use upgrade world.**
 
-Although the original intention was for this to be a BC feature, I realized that it can help people who do not want to use BC.
+Although the original intention was for this to be a Better Continents feature, I realized that it can help people who do not want to use Better Continents.
 
 
 
@@ -23,12 +32,14 @@ Although the original intention was for this to be a BC feature, I realized that
  **Performance Gains:**
 There are two kinds of performance gain.
  Speed and success rate. 
+***For a vanilla game you should be able to generate the world in 3-6 seconds depending on your rig.***
+
 In a heavily modded setup (details later) :
  Total Requested:  17,391 location tokens, same seed (aabbxx)
  
 #### *Vanilla (deterministic)*
 
-  Total Time:       **27m 39.7s**
+  Total Time:       **27m 39.7s** 
   
   Total Placed:     16,849  (96.88%)
   
@@ -66,15 +77,19 @@ The trend is:
 
 ---------
 **The Diagnostic Logger :** 
+
 You can run LPA purely as a diagnostic tool in any mode. For example you could leave it in Vanilla, which would leave the vanilla placement logic intact but inject telemetry, outputting an exhaustive log of exactly what happened, and precisely *why* (Altitude, Distance, Biome, etc.) failed locations were rejected.
 
 --------
 **Smart Recovery (Constraint Relaxation):** 
+
 If a vital location (e.g., bosses, quest locations, traders) fails to spawn because the map is too crowded or the terrain is rough or whatever the reason, LPA detects the bottleneck, slightly (or as much as you want and if you want) relaxes the rules (like altitude or distance constraints) , and retries until the world is playable or fails at the relaxed cases too. You can decide how many times you want to keep relaxing. If a location that requires enough of it placed for the game to be playable (e.g. you need enough crypts for iron) then the relaxation happens (if you have it on) until it places at least 50% of the amount. 
 The relaxation never attempts to put more than the min required. So for vital stuff it tries to place at most one, and for locations that require enough it would relax to place at most 50% of them.
 
 ---------
-**EWD integration:** you can add *relaxableunique*, *relaxable*, and *relaxableamount* keywords in your locations yaml, and design your own simple relaxation schemas. 
+**EWD integration:** 
+
+you can add *relaxableunique*, *relaxable*, and *relaxableamount* keywords in your locations yaml, and design your own simple relaxation schemas. 
 
 - relaxableunique: true/false 
 If absent from the yaml it defaults to false.
@@ -92,17 +107,56 @@ How hard it will try to do so, depends on the settings in your config.
 
 -----------
 **Interleaved Placement:**
+
 This is basically a fairness mode. Vanilla places locations one type at a time. So if you have three kinds of huts, A, B and C, all wanting the same biome, it will first place all As, then all Bs, and then all Cs. 
 This means that Cs are getting the short end of the stick, if A and B huts have captured all available spots. 
 
 This mode instead will place an A, then a B, then a C, then an A, then a B, and so on. 
 Thus it prevents a single location type from monopolizing all the good terrain before other locations get a chance to spawn.
 
+So:
+AAAAABBBBBCCCCC  
+with only 8 spots would  give you 
+AAAAABBB
+
+no C, and only 3 Bs. 
+
+Interleaved would give you:
+ABCABCAB 
+
+making thing more varied and fair. 
+
+
 ----------
 **Parallel Minimap Generation:** 
+
 Generates the world map textures across multiple threads. A process that normally freezes the game for 6-10 seconds in vanilla now finishes in under ~2 seconds. (This applies to vanilla world  only. See known issues about how it interacts with EWS and BC for the moment).
 
+Note that, at the moment the minimap is handled as follows:
+BC>LPA>EWS
 
+i.e. if BC is available it takes over the minimap and LPA handles the location placement only. If BC is missing and you have just LPA + EWS then LPA takes over. 
+If you use LPA without any of those things it handles the minimap itself. 
+
+Using LPA with EWS and setting EWS minimap size to 8 (it the max Unity can handle) takes about 2m instead of 16 minutes while the locations placement itself would take 5s or so.  
+
+----------
+**genloc and Upgrade World.**
+
+You can do vanilla genloc in game to place locations in unexplored areas. (e.g. you installed a new mod, you need to place its locations you can do it with the genloc command from the console). The speed methods and everything are identical to world generation, so genloc happens in seconds. 
+
+If you want to place locations to explored areas you have to use Upgrade World. Upgrade World knows when LPA is there and it is using it again getting LPA speed and success rates. 
+Keep in mind that LPA absolutely respects UW restrictions (safe areas) regardless of relaxation settings. 
+
+e.g. you can do locations_remove * start to remove everything
+and locations_add * start to place the locations anew. 
+
+------------
+**API for modders** 
+
+LPA uses an API so that you can use it yourself (its how UW is using it). 
+
+------------
 ## Compatibility
   
 
@@ -111,30 +165,38 @@ LPA should be compatible with everything and anything unless it messes with loca
 * **Better Continents** 
 * **Expand World Size (EWS)** 
 * **Expand World Data (EWD)** 
+* **Upgrade World (UW)**
 
 Fully compatible. 
 
 In fact I was writing this to add it as functionality to Better Continents especially when it is used with EWS and larger radii. It is compatible with Jere's stuff by its very inception.
 
-It IS compatible with Riverheim but I have not used it myself.  
+It IS compatible with Riverheim.  
 
-It is not compatible with warp's  World Gen Accelerator but it is very compatible with his excellent More World Locations mod which I recommend. 
+It is not compatible with warp's  World Gen Accelerator but it is *very compatible* with his excellent More World Locations mod which I recommend. 
 
-Compatible with all other mods that add locations that I am aware of, monsterlabz, Therzie's mods, RtD mods (if you get an older version of those), Marlthon's mods, basically should work with anything that adds locations. 
+Compatible with all other mods that add locations that I am aware of, Ashenius' expand locations (I recommend), monsterlabz, Therzie's mods, RtD mods (if you get an older version of those that allows you to play with the one Soloredis currently blocks), Marlthon's mods, basically should work with anything that adds locations. 
+
+Compatible with Enigma, Heimdivers, and so on.
+
+If you encounter some compatibility problem with Jere's stuff, is because things have not been updated. Temporary situations (see known issues)
+
+
+
 
 ## Requirements
 Other than bepinex you do not need anything else. EWD and through it YamlDotNet are soft requirements if you want to define your own relaxation schemas.
 
 ## Known Issues
-- Errors thrown by EWD are completely cosmetic and will go away when EWD updates to include the three keywords. They work and you can ignore the "error".  
-- LPA for now does not wait for EWS to finish generating the minimap (and EWS will cause the minimap to regenerate no matter what). 
-- LPA for now does not wait for stock BC to finish generating the minimap. 
+- ~~LPA for now does not wait for EWS to finish generating the minimap (and EWS will cause the minimap to regenerate no matter what).~~ will be fixed on an update of EWS
+- ~~LPA for now does not wait for stock BC to finish generating the minimap.~~ will be fixed on an update of BC
 
 None of the above issues are issues for the user to care or functionality issues. Mostly issues for me. 
+You can always find me on Discord and I can give you the test versions of EWS or BC who do work as expected. 
 
 ## Tips
 1) Since LPA replaces the engine that vanilla uses, the numbers of location tokens that vanilla assumed to be appropriate to be given as budgets considering tons of failures would occur, now may result in overly dense in locations worlds because they will almost all be succeeding in being placed.  
-So avoid the temptation to set the locations in EWS to x4 just because you doubled the area. 
+So avoid the temptation to set the locations in Expand World Size to x4 just because you doubled the area while also you have added thousand of new locations. 
 
 2) Especially if you use mods that add locations, the numbers may become too high. 
 
@@ -152,10 +214,15 @@ The problem is that if you are close to 97-98% or higher... increasing those wil
 
 
 8) Setting:
+
 PlacementMode = Vanilla
+
 UseLegacyEngine = true
+
 EnableParallelPlacement = false
+
 MaxRelaxationAttempts = 0
+
 OptimizePlacementChecks = false
 
 will give you **identical to vanilla time and success** but with the diagnostic log to see what happened.
@@ -440,7 +507,13 @@ Since it was detected than altitude was the problem the altitude was relaxed by 
 4. (Optional) Disable or remove the mod. You only need it when creating a new world or forcing new location generation. It simply does not do anything otherwise.
 
 You can find me and ask for help on Discord at the Valheim World Editing server: https://discord.gg/uqY4V8Aw .
+There is a channel for LPA (#location-placement-accelerator) there.
+I can also be found on Valheim Worlds: https://discord.gg/EQGuUqj8 and often on  Odin+.
+In all of them as ZeuS or Kurios.ZeuS.
 
 You can find the source code on [github](https://github.com/Nick-Pappas/LocationPlacementAccelerator).
 
+
 You can find [yet another readme that explains what is going on behind the scenes on github too. It is a work in progress at the moment](https://github.com/Nick-Pappas/LocationPlacementAccelerator/blob/master/README%20for%20the%20more%20involved.md)
+
+Special thanks to JPValheim, Ashenius and Dhakhar for testing stuff!

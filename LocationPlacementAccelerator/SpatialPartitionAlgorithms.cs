@@ -1,4 +1,4 @@
-// v1
+// v1.1
 /**
 * Spatial partitioning for the replaced parallel placement engine.
 *
@@ -38,8 +38,11 @@
 * per GTS group). The AggressiveInlining hints eliminate call overhead
 * for the arithmetic helpers.
 * 
-* TODO: I should add my wedge partitioning algorithm here to compare. 
-* But it may be more work to debug, to end up making 4.6s to 4.3s...
+* 1.1: Added out blockIdP. To maintain parallelism without violating distance 
+* constraints, I realized I cannot lump an entire color into one massive work unit. 
+* I must chunk the world into individual Blocks, and dispatch all Blocks of the 
+* SAME color simultaneously ffs. This guarantees safety (same-color blocks are mathematically far apart) 
+* without bottlenecking the worker pool. This packs the 2D block coordinates into a single 32-bit int so the builder can group them cleanly.
 */
 #nullable disable
 using System;
@@ -152,41 +155,46 @@ namespace LPA
         }
 
         /**
-        * Maps a zone coordinate to its partition index. O(1) arithmetic.
+        * Maps a zone coordinate to its partition index and block ID. O(1) arithmetic.
         *
         * Called once per zone during BuildSpatialStreams (~50k zones per GT). Inlined to eliminate call overhead on that warm path.
-        *
-        * BitShift tier:
-        *   Divide zone coordinate by block size via right-shift (since both are powers of 2), 
-        *   then extract the color index via bitmask.
-        *   Combine X and Z color indices into a single flat partition index.
-        *   Example with C=2, K=4: zone (9,3) --> block (2,0) --> color (0,0) --> partition 0.
-        *
-        * Modulo tier:
-        *   Same logic but uses FloorDiv and FloorMod for arbitrary K and C.
         */
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static int GetPartition(Vector2i zoneP, ref PartitionRule ruleP)
+        public static void GetPartition(Vector2i zoneP, ref PartitionRule ruleP, out int colorIndexP, out int blockIdP)
         {
+            int bx = 0;
+            int bz = 0;
+
             switch (ruleP.Mode)
             {
                 case PartitionMode.BitShift:
-                {
-                    int colorX = (zoneP.x >> ruleP.BlockSizeLog2) & ruleP.ColorMask;
-                    int colorZ = (zoneP.y >> ruleP.BlockSizeLog2) & ruleP.ColorMask;
-                    return colorX | (colorZ << ruleP.ColorBits);
-                }
+                    {
+                        bx = zoneP.x >> ruleP.BlockSizeLog2;
+                        bz = zoneP.y >> ruleP.BlockSizeLog2;
+                        int colorX = bx & ruleP.ColorMask;
+                        int colorZ = bz & ruleP.ColorMask;
+                        colorIndexP = colorX | (colorZ << ruleP.ColorBits);
+                        break;
+                    }
 
                 case PartitionMode.Modulo:
-                {
-                    int colorX = FloorMod(FloorDiv(zoneP.x, ruleP.BlockSize), ruleP.ColorsPerAxis);
-                    int colorZ = FloorMod(FloorDiv(zoneP.y, ruleP.BlockSize), ruleP.ColorsPerAxis);
-                    return colorX * ruleP.ColorsPerAxis + colorZ;
-                }
+                    {
+                        bx = FloorDiv(zoneP.x, ruleP.BlockSize);
+                        bz = FloorDiv(zoneP.y, ruleP.BlockSize);
+                        int colorX = FloorMod(bx, ruleP.ColorsPerAxis);
+                        int colorZ = FloorMod(bz, ruleP.ColorsPerAxis);
+                        colorIndexP = colorX * ruleP.ColorsPerAxis + colorZ;
+                        break;
+                    }
 
                 default:
-                    return 0;
+                    colorIndexP = 0;
+                    break;
             }
+
+            // Pack bx and bz into a 32-bit int. A zone is 64m. World radius is max 100,000m (1562 zones). BlockSize is at least 1.
+            // So bx and bz are in range [-1562, 1562], fitting easily in 16 bits. 
+            blockIdP = (bx & 0xFFFF) | (bz << 16);
         }
 
         /**
@@ -241,3 +249,4 @@ namespace LPA
         }
     }
 }
+//TODO: find where the hell have I put the code for the wedge partitioning algorithm and add it. 
