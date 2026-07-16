@@ -25,9 +25,9 @@
 *
 * 1.0.8: Closed the min-distance race. The coloring was always sound - same-color blocks are >= minDist
 * apart by construction - but the dispatcher never honored it. Non-interleaved dumped every color of a GT
-* into the queue back to back, so workers pulled ADJACENT colors of the same group, and adjacent colors touch. 
-* Between HasConflict and CommitToGroup sits the rest of the dart's filters, a return, a quota claim
-* and a zone claim, and the only atomic claim in that window is _pendingOccupancy, which is keyed by zone
+* into the queue back to back, so workers pulled ADJACENT colors of the same group, and adjacent colors
+* touch. Between HasConflict and CommitToGroup sits the rest of the dart's filters, a return, a quota claim
+* and a zone claim, and the only atomic claim in that window is _pendingOccupancy, which is keyed by zone -
 * useless for two placements thirty metres apart across a zone boundary. Both workers read clear, both
 * committed. Rare, but real, and the reason two same-group locations occasionally sat far closer than their
 * radius allows.
@@ -84,8 +84,66 @@
 *   
 *   Almost made me rename the mod from LPA to PIA.
 *   God class, with lots of god methods. Enjoy, me reading this a year from now.
-*   
-*/
+*     
+*
+* 1.0.9: maxDistanceFromSimilar. Three pieces here basicaly, the rule itself and why it inverts everything are in
+* Core's header.
+*
+* HOST GATE. 
+* So first of all a host or landlord type must place before its tenants.
+* Vanilla does this by using the prioritized...fine. But the user should know that if they make their 
+* own yamls with EWD or they make nonsense yamls. 
+* A max type placing before its hosts exist throws every dart into an empty world and gets
+* nothing. As I said vanilla happens to be safe (CharredFortress is prioritized, so it is down before FortressRuins
+* is ever dispatched) but that is luck and I am not counting on luck. A stream carrying a querier holds its
+* first color until every host prefab has drained. Only pure advertisers count as hosts (see Core's
+* BuildMaxHosts), so the wait graph is depth one and cannot cycle. Two more things keep it deadlock-free:
+* a prioritized stream only ever waits on prioritized hosts (waiting on a non-prioritized one would wait
+* across the priority barrier), and a host in my own stream is dropped, since a
+* stream cannot wait on itself. That last one is a real gap for a yaml where landlord and tenant share
+* both m_group and m_groupMax which does not happen in vanilla, nothing I have seen anywhere, and I would rather leave it visible
+* here than paper it with a tier sort I already decided against.
+*
+* One crossing deliberately even though in theory maxdistancefromsimilar would benefit from a revisit.
+* A max querier walks its candidate zones exactly once, same as everything else. 
+* I went a bit bananas on this one so it is worth writing down why not for the future.
+*
+* Vanilla's outer loop samples zones at random WITH replacement, 100k (or 200k) times, so it keeps stumbling back
+* onto spots it rejected before a host landed near them. I walk each candidate once, so I only catch that
+* when the zone happens to sort after the placement that made it legal. The gap is real but it is small
+* and it is not worth what closing it costs: a second crossing re-throws every dart through slope, biome
+* and altitude, and those rejections are deterministic as the zone was the wrong biome the first time and
+* it is the wrong biome now. That is the whole per-zone cost paid again to buy back the last handful of a
+* single type. Vanilla budgets for the shortfall anyway for a single prefab the what do you call it, and they want 100 of those.
+* In my experience vanilla has the quantities written assuming roughly 95% density on a 10k radius world.
+*
+* And I get the chaining for free where it happens naturally, because the grid is live: every placement
+* commits its own circle, so a dart thrown later near an earlier FortressRuins passes on the same bit read
+* with no bookkeeping at all. No list of host positions, nothing to maintain, nothing to invalidate.
+*
+* CHUNK COLLAPSE FIX. chunkCount had two unrelated jobs living in one variable, and the OFF branch of
+* ParallelExactSpacing only had business with one of them.
+*
+* Job 1: when a sub-group DOES have a similarity radius, its zones are graph-colored into partitions,
+* and chunkCount decides whether a color is split further across threads or dispatched as one unit.
+* ParallelExactSpacing OFF collapsing this to 1 is the intended tradeoff - threads may then cross a
+* partition boundary within a color, which is the source of the rare ~1.4m spacing violation the flag
+* exists to permit in exchange for speed. This is the ONLY thing the flag is about.
+*
+* Job 2: when a sub-group has NO similarity radius (minDist 0), there is no coloring at all - it is the
+* Single tier, one color by construction, nothing to keep apart. Here chunkCount was only ever doing
+* "how many pieces do I split this type's zone list into for the thread pool", which has no relationship
+* to boundary races because there are no boundaries. The old code collapsed it to 1 anyway, purely
+* because both cases ran through the same three lines not because OFF was ever supposed to reach it.
+* The result was that something like 700 InfestedTrees, 500 road posts, every one of the 31 vanilla types 
+* with no min rule was STUPIDLY single-threaded, regardless of what ParallelExactSpacing was set to.
+* So.. f................ck that. ffs. 
+*
+* subGroupHasSimilarityRadius restricts the collapse to Job 1. If ParallelExactSpacing is ever removed
+* from the config entirely as I am considering doing, Job 2 needs no equivalent.
+* There was never a real tradeoff there, only an accidental one. See SpatialPartitionAlgorithms v3 for the caller-side half:
+* the Single tier now hands back the zone coordinate instead of a constant 0, which is what lets these types spread across chunks
+* once chunkCount is no longer being forced to 1 underneath them.*/
 #nullable disable
 using System;
 using System.Collections;
@@ -133,6 +191,7 @@ namespace LPA
 
         private static ConcurrentDictionary<string, int> _totalZonesPerPrefab;
 
+
         private struct OrderedEntry
         {
             public ZoneLocation Loc;
@@ -169,6 +228,11 @@ namespace LPA
             public ZoneLocation Loc;
             public string Group;
             public PresenceGrid Grid;
+
+            // Null unless this type queries maxDistanceFromSimilar. Resolved at build time so the dart
+            // loop never touches the registry.
+            public PresenceGrid MaxGrid;
+
             public List<Vector2i> Zones;
             public PlacementCounters Counters;
             public TelemetryContext TelCtx;
@@ -193,6 +257,13 @@ namespace LPA
             * dispatcher side gives the same acquire semantics without the warning.
             */
             public int InFlightWorkUnits;
+
+            /**
+            * The _inFlightRegions counters this stream must see at zero before it opens its first color.
+            * Empty for every stream on a vanilla world except FortressRuins'. Boxes rather than names so
+            * the gate is a handful of reads and no hashing.
+            */
+            public List<StrongBox<int>> HostRegionCounters;
         }
 
         private class SubGroupStream
@@ -311,7 +382,11 @@ namespace LPA
 
             if (!exactSpacing)
             {
-                DumpStreams(gtsStreams, true);
+                IEnumerator dumpPrio = DumpStreams(zsP, gtsStreams, true, yieldSw, YieldIntervalMs);
+                while (dumpPrio.MoveNext())
+                {
+                    yield return dumpPrio.Current;
+                }
 
                 while (!_priorityBarrierDone.IsSet)
                 {
@@ -324,7 +399,11 @@ namespace LPA
                     }
                 }
 
-                DumpStreams(gtsStreams, false);
+                IEnumerator dumpRest = DumpStreams(zsP, gtsStreams, false, yieldSw, YieldIntervalMs);
+                while (dumpRest.MoveNext())
+                {
+                    yield return dumpRest.Current;
+                }
             }
             else
             {
@@ -547,6 +626,16 @@ namespace LPA
                 return true;
             }
 
+            /**
+            * Nothing of this stream goes out while a host is still placing. Returning true without
+            * enqueueing keeps the dispatcher lapping - it will come back, and meanwhile it drains
+            * placements and feeds the GUI, so no frame is burned waiting.
+            */
+            if (StreamIsWaitingOnHosts(streamP))
+            {
+                return true;
+            }
+
             SubGroupStream currentSubGroup = streamP.SubGroups[streamP.CurrentSubGroup];
             if (currentSubGroup.CurrentColorIndex >= currentSubGroup.Colors.Count)
             {
@@ -569,24 +658,89 @@ namespace LPA
             return true;
         }
 
-        // The ungated path: everything at once, colors of a GT concurrent, race live. Kept only as the baseline to measure the gate against.
-        private static void DumpStreams(List<GtsStream> streamsP, bool prioritizedP)
+        private static bool StreamIsWaitingOnHosts(GtsStream streamP)
         {
+            List<StrongBox<int>> hostCounters = streamP.HostRegionCounters;
+            if (hostCounters == null)
+            {
+                return false;
+            }
+            for (int i = 0; i < hostCounters.Count; i++)
+            {
+                if (Volatile.Read(ref hostCounters[i].Value) > 0)
+                {
+                    return true;
+                }
+            }
+            /**
+            * Once satisfied it stays satisfied - hosts only ever finish - so drop the list and the check
+            * costs one null test for the rest of the run.
+            */
+            streamP.HostRegionCounters = null;
+            return false;
+        }
+
+        /**
+        * The ungated path: everything at once, colors of a GT concurrent, race live. Kept only as the
+        * baseline to measure the gate against.
+        *
+        * The host wait is NOT part of what this branch exists to reproduce. It is not the spacing
+        * guarantee, it is the difference between a max type placing its quota and placing nothing, and
+        * switching it off would not measure a cost, it would measure a bug. So this branch waits too.
+        *
+        * Which means it can no longer dump in one pass. Walking the list in order and blocking on a wait
+        * deadlocks the moment a querier sits ahead of its host: the host's units only enter the queue when
+        * the walk REACHES it, and the walk is stopped waiting for the host to finish placing them. So it
+        * laps instead, exactly like the gated dispatcher - dump whatever is open, drain, come back - and a
+        * stream leaves the pending list only once it has actually gone out. Everything that is not waiting
+        * still goes out on the first lap, so the ungated shape is unchanged for the 148 types that have no
+        * max rule.
+        */
+        private static IEnumerator DumpStreams(ZoneSystem zsP, List<GtsStream> streamsP, bool prioritizedP,
+                                                Stopwatch yieldSwP, long yieldIntervalMsP)
+        {
+            List<GtsStream> pending = new List<GtsStream>();
             foreach (GtsStream stream in streamsP)
             {
-                if (stream.IsPrioritized != prioritizedP)
+                if (stream.IsPrioritized == prioritizedP)
                 {
-                    continue;
+                    pending.Add(stream);
                 }
-                foreach (SubGroupStream sg in stream.SubGroups)
+            }
+
+            while (pending.Count > 0)
+            {
+                // Backwards so RemoveAt does not shuffle the ground out from under the index.
+                for (int i = pending.Count - 1; i >= 0; i--)
                 {
-                    foreach (ColorBatch batch in sg.Colors)
+                    GtsStream stream = pending[i];
+                    if (StreamIsWaitingOnHosts(stream))
                     {
-                        for (int w = 0; w < batch.WorkUnits.Count; w++)
+                        continue;
+                    }
+
+                    foreach (SubGroupStream sg in stream.SubGroups)
+                    {
+                        foreach (ColorBatch batch in sg.Colors)
                         {
-                            Interlocked.Increment(ref stream.InFlightWorkUnits);
-                            _workQueue.Add(batch.WorkUnits[w]);
+                            for (int w = 0; w < batch.WorkUnits.Count; w++)
+                            {
+                                Interlocked.Increment(ref stream.InFlightWorkUnits);
+                                _workQueue.Add(batch.WorkUnits[w]);
+                            }
                         }
+                    }
+                    pending.RemoveAt(i);
+                }
+
+                if (pending.Count > 0)
+                {
+                    DrainAndCommit(zsP);
+                    UpdateAnnulus(zsP);
+                    if (yieldSwP.ElapsedMilliseconds >= yieldIntervalMsP)
+                    {
+                        yieldSwP.Restart();
+                        yield return null;
                     }
                 }
             }
@@ -676,7 +830,8 @@ namespace LPA
                     * reason this branch exists.
                     */
                     int chunkCount = Math.Max(1, _parallelThreadCount);
-                    if (!ModConfig.ParallelExactSpacing.Value)
+                    bool subGroupHasSimilarityRadius = sgMinDist > 0f;
+                    if (!ModConfig.ParallelExactSpacing.Value && subGroupHasSimilarityRadius)
                     {
                         chunkCount = 1;
                     }
@@ -773,6 +928,7 @@ namespace LPA
                                     Loc = entry.Loc,
                                     Group = grpKey,
                                     Grid = grid,
+                                    MaxGrid = ResolveMaxGrid(entry.Loc),
                                     Zones = zones,
                                     Counters = ctr,
                                     TelCtx = telCtx
@@ -812,6 +968,8 @@ namespace LPA
 
                 streams.Add(stream);
             }
+
+            AttachHostGates(streams, gtsMap, gtsOrder);
 
             // Compute total zones for annulus denominator and per-prefab tracking.
             int totalZones = 0;
@@ -893,6 +1051,7 @@ namespace LPA
                                 Loc = entry.Loc,
                                 Group = grp,
                                 Grid = grid,
+                                MaxGrid = ResolveMaxGrid(entry.Loc),
                                 Zones = new List<Vector2i>(),
                                 Counters = sentinelCtr,
                                 TelCtx = sentinelTel
@@ -910,6 +1069,93 @@ namespace LPA
             }
 
             return streams;
+        }
+
+        /**
+        * Hangs each querying stream's host counters on it. Runs once over the streams; on a vanilla world
+        * exactly one stream comes out with a non-null list and it has one entry.
+        *
+        * Two exclusions, both load-bearing and both explained in the file header: a prioritized stream
+        * never waits on a non-prioritized host (that would wait across the priority barrier, and the
+        * barrier is waiting on me), and a host that lives in my own stream is dropped (a stream cannot
+        * wait on itself).
+        */
+        private static void AttachHostGates(List<GtsStream> streamsP,
+                                            Dictionary<string, List<OrderedEntry>> gtsMapP,
+                                            List<string> gtsOrderP)
+        {
+            if (_maxHostsByPrefab == null || _maxHostsByPrefab.Count == 0)
+            {
+                return;
+            }
+
+            // Prefab --> the group key of the stream it lives in, so I can spot a host that is one of mine.
+            Dictionary<string, string> streamKeyByPrefab = new Dictionary<string, string>(StringComparer.Ordinal);
+            Dictionary<string, bool> priorityByPrefab = new Dictionary<string, bool>(StringComparer.Ordinal);
+            foreach (string grpKey in gtsOrderP)
+            {
+                foreach (OrderedEntry entry in gtsMapP[grpKey])
+                {
+                    streamKeyByPrefab[entry.Loc.m_prefabName] = grpKey;
+                    priorityByPrefab[entry.Loc.m_prefabName] = entry.Loc.m_prioritized;
+                }
+            }
+
+            foreach (GtsStream stream in streamsP)
+            {
+                List<StrongBox<int>> gateCounters = null;
+
+                foreach (OrderedEntry entry in gtsMapP[stream.GroupKey])
+                {
+                    List<string> hosts = GetMaxHostPrefabs(entry.Loc.m_prefabName);
+                    if (hosts == null || hosts.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    for (int i = 0; i < hosts.Count; i++)
+                    {
+                        string hostPrefab = hosts[i];
+
+                        bool hostIsInThisStream = streamKeyByPrefab.TryGetValue(hostPrefab, out string hostStreamKey)
+                            && hostStreamKey == stream.GroupKey;
+                        if (hostIsInThisStream)
+                        {
+                            DiagnosticLog.WriteTimestampedLog(
+                                $"[LPA] MAXQ {entry.Loc.m_prefabName} depends on {hostPrefab} but they share stream " +
+                                $"{stream.GroupKey}; ordering not enforced.",
+                                BepInEx.Logging.LogLevel.Warning);
+                            continue;
+                        }
+
+                        bool hostIsPrioritized = false;
+                        priorityByPrefab.TryGetValue(hostPrefab, out hostIsPrioritized);
+                        if (stream.IsPrioritized && !hostIsPrioritized)
+                        {
+                            DiagnosticLog.WriteTimestampedLog(
+                                $"[LPA] MAXQ prioritized {entry.Loc.m_prefabName} depends on non-prioritized " +
+                                $"{hostPrefab}; ordering not enforced (would deadlock the priority barrier).",
+                                BepInEx.Logging.LogLevel.Warning);
+                            continue;
+                        }
+
+                        if (!_inFlightRegions.TryGetValue(hostPrefab, out StrongBox<int> hostCounter))
+                        {
+                            continue;
+                        }
+                        if (gateCounters == null)
+                        {
+                            gateCounters = new List<StrongBox<int>>();
+                        }
+                        if (!gateCounters.Contains(hostCounter))
+                        {
+                            gateCounters.Add(hostCounter);
+                        }
+                    }
+                }
+
+                stream.HostRegionCounters = gateCounters;
+            }
         }
 
         private static void WorkerBody(ZoneSystem zsP, int workerIdxP)
@@ -1040,7 +1286,7 @@ namespace LPA
                 }
 
                 if (EvaluateZoneParallel(loc, zoneID, zoneGridIdx, twP.Grid, group,
-                                         ctr, twP.TelCtx, out Vector3 pos))
+                                         ctr, twP.TelCtx, twP.MaxGrid, out Vector3 pos))
                 {
                     // Atomically claim a placement slot. If another worker beat us to filling the quota, undo and stop.
                     if (Interlocked.Decrement(ref _remainingToPlace[prefabP].Value) < 0)
@@ -1058,6 +1304,7 @@ namespace LPA
                     }
 
                     CommitToGroup(group, pos);
+                    CommitMaxAdvertise(loc, pos);
                     _resultQueue.Enqueue(new PlacementResult
                     {
                         Loc = loc,
@@ -1093,6 +1340,7 @@ namespace LPA
                 agg.ErrBiome += ctr.ErrBiome;
                 agg.ErrAlt += ctr.ErrAlt;
                 agg.ErrSim += ctr.ErrSim;
+                agg.ErrNotSim += ctr.ErrNotSim;
                 agg.ErrTerrain += ctr.ErrTerrain;
                 agg.ErrForest += ctr.ErrForest;
             }
@@ -1257,6 +1505,7 @@ namespace LPA
             }
             PresenceGrid grid = PresenceGrid.GetOrCreate(
                 $"{group}:{relaxLocP.m_minDistanceFromSimilar:F0}");
+            PresenceGrid maxGrid = ResolveMaxGrid(relaxLocP);
             int budget = _outerBudgetBase;
             if (relaxLocP.m_prioritized)
             {
@@ -1297,7 +1546,7 @@ namespace LPA
                     }
 
                     if (EvaluateZoneParallel(relaxLocP, zoneID, relaxZoneGridIdx, grid, group,
-                                             relaxCtr, relaxTel, out Vector3 pos))
+                                             relaxCtr, relaxTel, maxGrid, out Vector3 pos))
                     {
                         if (!_pendingOccupancy.TryAdd(zoneID, 1))
                         {
@@ -1306,6 +1555,7 @@ namespace LPA
                         }
 
                         CommitToGroup(group, pos);
+                        CommitMaxAdvertise(relaxLocP, pos);
                         _resultQueue.Enqueue(new PlacementResult
                         {
                             Loc = relaxLocP,
@@ -1431,6 +1681,7 @@ namespace LPA
             ZoneLocation locP, Vector2i zoneIDP, int zoneGridIdxP,
             PresenceGrid groupGridP, string groupP,
             PlacementCounters ctrP, TelemetryContext telCtxP,
+            PresenceGrid maxGridP,
             out Vector3 position)
         {
             position = Vector3.zero;
@@ -1484,6 +1735,17 @@ namespace LPA
                         ctrP.ErrSim++;
                         continue;
                     }
+                }
+
+                /**
+                * Mirror of Core's. No lock, no snapshot, no confirmation: max is monotone, so the worst a
+                * stale read can do is turn down a spot that just became legal, and the next crossing picks
+                * it up. This is the one similarity check that does not need the color gate behind it.
+                */
+                if (maxGridP != null && !maxGridP.HasConflict(p))
+                {
+                    ctrP.ErrNotSim++;
+                    continue;
                 }
 
                 if (locP.m_maxTerrainDelta > 0f || locP.m_minTerrainDelta > 0f)

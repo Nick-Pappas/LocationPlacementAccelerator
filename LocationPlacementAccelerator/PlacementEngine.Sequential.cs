@@ -1,4 +1,4 @@
-// v1.2
+// v1.3
 /**
 * Sequential (single-threaded) placement path for the replaced engine.
 *
@@ -25,6 +25,21 @@
 * relax-quantity restore) are  inside EndGeneration itself.
 * The * overlay teardown and summary log run in both paths now and 
 * I am not left with the GUI staring at me.
+*
+* 1.3: maxDistanceFromSimilar. Resolved once per LTS next to groupGrid and handed to EvaluateZone. That
+* is the whole change on this path one grid handle, one extra argument, no second loop anywhere.
+*
+* Nothing chases the last few placements. A max type gets one crossing of its candidate zones like
+* everything else, and whatever chaining the shuffle happens to hand it (a zone landing after the
+* placement that made it legal) it keeps, because the grid is live, every placement commits its own
+* circle, so a later dart near an earlier ruin passes on the same bit read. Vanilla only does better than
+* that because it resamples zones 100k times with replacement, and it budgets for the shortfall anyway I think.
+* With circles around hosts only and no spreading, which APPEARS to ME to be IGs intention, the arithmetic is fixed 
+* by the geometry above. The dart is the zone centre. From a fortress at a zone centre, the zones within 70m are 
+* the four orthogonal neighbours at 64m. The diagonals are at 90.5m and are out of range. So four slots per fortress. 
+* Twenty fortresses. Eighty slots. So if their intention was for placing around 80 the accounted for the natural misses 
+* that they would encountered. All that is me assuming that they were going this kind of big anchor with satellites thing.
+* 
 */
 #nullable disable
 using System;
@@ -119,6 +134,7 @@ namespace LPA
                     group = loc.m_group;
                 }
                 PresenceGrid groupGrid = PresenceGrid.GetOrCreate($"{group}:{loc.m_minDistanceFromSimilar:F0}");
+                PresenceGrid maxGrid = ResolveMaxGrid(loc);
                 int baseBudget = 100000;
                 if (loc.m_prioritized)
                 {
@@ -163,7 +179,7 @@ namespace LPA
                         continue;
                     }
 
-                    placed = EvaluateZone(zsP, loc, zoneID, groupGrid, group, ctr, telCtx);
+                    placed = EvaluateZone(zsP, loc, zoneID, groupGrid, group, ctr, telCtx, maxGrid);
 
                     if (++yieldCounter >= YieldEvery)
                     {
@@ -338,7 +354,7 @@ namespace LPA
                                 continue;
                             }
 
-                            placed = EvaluateZone(zsP, relaxLoc, zoneID, relaxGrid, relaxGroup, relaxCtr, relaxTelCtx);
+                            placed = EvaluateZone(zsP, relaxLoc, zoneID, relaxGrid, relaxGroup, relaxCtr, relaxTelCtx, ResolveMaxGrid(relaxLoc));
 
                             if (++yieldCounter >= YieldEvery)
                             {
@@ -418,6 +434,7 @@ namespace LPA
                 group = locP.m_group;
             }
             PresenceGrid groupGrid = PresenceGrid.GetOrCreate($"{group}:{locP.m_minDistanceFromSimilar:F0}");
+            PresenceGrid maxGrid = ResolveMaxGrid(locP);
             int baseBudget = 100000;
             if (locP.m_prioritized)
             {
@@ -481,7 +498,7 @@ namespace LPA
                         continue;
                     }
 
-                    placed = EvaluateZone(zsP, locP, zoneID, groupGrid, group, ctrP, telCtx);
+                    placed = EvaluateZone(zsP, locP, zoneID, groupGrid, group, ctrP, telCtx, maxGrid);
 
                     if (++yieldCounter >= YieldEvery)
                     {

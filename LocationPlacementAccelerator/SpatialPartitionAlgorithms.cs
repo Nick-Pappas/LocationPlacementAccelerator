@@ -1,4 +1,4 @@
-// v2
+// v3
 /**
 * Spatial partitioning for the replaced parallel placement engine.
 *
@@ -48,6 +48,21 @@
 * it back. Any grouping of same-color blocks is mutually >= minDist, so the caller is free to coarsen blocks
 * into as many chunks as it has workers and run them all concurrently inside one color. I return the raw
 * block id rather than a chunk id because the chunk count is the caller's business, not the geometry's.
+*
+* v3: The Single tier used to hand back block id 0 for every zone, which quietly cost me the whole
+* second source of parallelism on any type that has no similarity constraint. Single fires when
+* minDist <= 0, and the caller derives its chunk from the block id, so every zone of such a type
+* landed in chunk 0 - one work unit, one thread, the entire world. InfestedTree01 (700), the road
+* posts (500), the graves, the ruins, the wood houses: 31 vanilla types and roughly 3,300 locations,
+* every one of them on a single thread. HAIR PULLING STUFF. 
+* It never showed up as a hang because those types sit in their own streams and the other 118 kept the pool busy,
+* but whichever of them finishes last IS the tail everything else waits on. I mean it is the principle of it.
+*
+* Handing back the packed zone coordinate instead spreads them over the chunks with no other change.
+* It is safe for free, and the proof is shorter than the BitShift one: Single only ever fires when
+* minDist <= 0 (no constraint exists, so no arrangement of the work can violate it) or when there is
+* at most one partition to hand out (the caller collapses to one chunk anyway). There is no color
+* to respect because there is nothing to keep apart.
 */
 #nullable disable
 using System;
@@ -204,9 +219,16 @@ namespace LPA
                         return;
                     }
 
+                /**
+                * Single. One color, so colorIndex is 0 and there is no gate to honour. The block id is
+                * the zone itself: with no similarity radius there are no blocks, but the caller still
+                * needs SOMETHING that varies per zone or its chunking collapses onto one thread. Zone
+                * coordinates pack injectively for the same reason block coordinates do - a 50km world is
+                * +-781 zones, nowhere near the 16-bit field.
+                */
                 default:
                     colorIndexP = 0;
-                    blockIdP = 0;
+                    blockIdP = PackBlockId(zoneP.x, zoneP.y);
                     return;
             }
         }

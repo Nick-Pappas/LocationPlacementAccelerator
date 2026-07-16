@@ -199,7 +199,8 @@ namespace LPA
 				_logWriter.WriteLine($"  Multithreaded:        {(ModConfig.EnableParallelPlacement.Value ? "ON" : "OFF")}");
 				_logWriter.WriteLine($"  Interleaved:          {(ModConfig.EnableInterleavedScheduling.Value ? "ON" : "OFF")}");
 				_logWriter.WriteLine($"  PresenceGrid Cell:    {ModConfig.PresenceGridCellSize.Value}m");
-			}
+                _logWriter.WriteLine($"  Exact Spacing:        {(ModConfig.ParallelExactSpacing.Value ? "ON" : "OFF")}");
+            }
 
 			_logWriter.WriteLine($"  Outer Multiplier:     {ModConfig.OuterMultiplier.Value}x");
 			_logWriter.WriteLine($"  Inner Multiplier:     {ModConfig.InnerMultiplier.Value}x");

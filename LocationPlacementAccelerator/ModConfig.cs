@@ -257,6 +257,7 @@ namespace LPA
                 "distances between similar location types.\n" +
                 "\n" +
                 "Smaller values = finer resolution = higher memory use.\n" +
+                "THAT IS: the smaller the better your success rate.\n" +
                 "Minimum: 4m. Default 16m uses approximately 4.9 MB per location group\n" +
                 "at maximum world radius.");
 
@@ -285,15 +286,20 @@ namespace LPA
             ParallelExactSpacing = configP.Bind("7 - Advanced", "ParallelExactSpacing", false,
                 "Only applies to the parallel (multi-threaded) replaced engine.\n" +
                 "\n" +
-                "OFF by default. When OFF, each similarity color is dispatched as a single work unit and all\n" +
-                "colors are handed out at once, so several threads place one group in parallel. This is fast and\n" +
-                "is how the engine has always behaved; the only cost is that two same-group locations may VERY\n" +
-                "rarely spawn slightly closer than minDistanceFromSimilar right at a partition boundary.\n" +
+                "OFF by default. When OFF, placement is fast and this is how the engine\n" +
+                "has always behaved. The cost: two same-group locations may rarely spawn closer\n"+
+                "than minDistanceFromSimilar, something around 5 pairs per 1,000 locations in tightly-packed groups on a\n" +
+                "vanilla-density world. When it happens the error may be of any magnitude: adjacent partitions touch, so the\n" +
+                "pair can land anywhere from basically touching to the correct minDistanceFromSimilar apart minus a meter.\n" +
+                "For Mistlands Giants for example out of 87990 pairwise comparisons, there was one pair that was 160.77m apart instead of 250m. \n" +
                 "\n" +
-                "When ON, each color is further split into spatially-separated blocks and a barrier holds each\n" +
-                "color until it finishes before the next begins, which guarantees minDistanceFromSimilar is\n" +
-                "respected exactly under multithreading. This adds a one-time build cost (can exceed a second on\n" +
-                "large modded worlds) and lowers throughput. Turn ON only if exact spacing matters to you.\n" +
+                "When ON, the engine guarantees minDistanceFromSimilar to within\n" +
+                "the exclusion grid's cell diagonal (a few metres) under multithreading.\n" +
+                "The cost is about between 12%-14% of placement time, and that percentage holds as worlds grow.\n" +
+                "Turn ON only if you cannot tolerate the rare large violation described above.\n" +
+                "I set the default to off because the tradeoff 12%-14% slower for maybe 5 out of 1000 locations not exact \n"+
+                "is not worth it in my opinion.\n"+
+                "But if you want absolute adherence with just a few + or - a meter or so, then turn this to true. \n"+
                 "\n" +
                 "NOTE: Changing this requires a full game restart.");
 

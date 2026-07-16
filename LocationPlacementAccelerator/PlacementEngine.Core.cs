@@ -1,4 +1,4 @@
-// v1.0.5
+// v1.0.6
 /**
 * Core of the replaced placement engine. This partial class contains:
 *  Run(): the entry-point coroutine called by ReplacedEnginePatches
@@ -42,6 +42,42 @@
 * quantity, token-list build does).
 *
 * 1.0.5: Public API plumbing.
+*
+* 1.0.6: maxDistanceFromSimilar. Vanilla has carried this rule since the AshLands patch and I have
+* never implemented it, so FortressRuins has been placing 100/100 wherever it liked instead of
+* huddling round the CharredFortresses.
+*
+* The thing that took me longest to see is that vanilla has TWO group systems, not one. HaveLocationInRange
+* takes a maxGroup flag: false compares my m_group against THEIR m_group, true compares my m_groupMax
+* against THEIR m_groupMax. m_group is never tested against m_groupMax in either direction. So every
+* location carries two independent memberships and the whole engine - streams, coloring, sub-group
+* ordering, the grids - only ever modelled the first one. That is the gap. Not "a rule I skipped": a
+* second membership system I never built.
+*
+* The proof they are separate is sitting in the vanilla yaml: CharredRuins1's m_group is "zigg" and
+* FortressRuins' m_groupMax is "zigg". Same string, zero interaction, because one is only read by the
+* false-flag call and the other only by the true-flag call. That is exactly why every grid key below is
+* prefixed MAX: - the day someone writes a maxDistanceFromSimilar of 256 the two would collide on
+* "zigg:256" and CharredRuins1's exclusion footprint would silently start advertising itself as a host.
+*
+* The rule inverts everything min assumes. Min gets HARDER as a run proceeds - every placement carves
+* out territory, and a spot rejected early is only more rejected later. Max gets EASIER - at the start
+* nowhere is legal because nothing is down yet, and every placement opens new ground. Three things fall
+* out of that and all three are handled here or in Parallel/Sequential:
+*
+*   1. Bootstrapping. A max type cannot place anything until its hosts exist. In vanilla this is free
+*      (CharredFortress is prioritized) but I will not rely on luck, so BuildMaxHosts records who each
+*      querier depends on and the parallel dispatcher gates on it.
+*   2. Revisiting. Vanilla re-samples zones with replacement 100k times, so it stumbles back onto spots
+*      it rejected before a host landed nearby. I walk each candidate once. For min that is free; for max
+*      it is fatal, because the chain (FortressRuins is a member of zigg, so each one hosts the next) only
+*      forms if the child zone happens to sort after its parent. Both paths now re-walk for max types only.
+*   3. No race. Max is monotone - a concurrent commit only makes the answer MORE true, so a worker reading
+*      a stale clear bit loses a placement, never correctness. The color gate does not extend over max
+*      and must not: there is nothing to keep apart.
+*
+* Cost when nothing uses max: _maxQueries.Length == 0, so CommitMaxAdvertise returns on a length check
+* and EvaluateZone's max branch is a null test on a local. Vanilla has exactly one querier.
 */
 #nullable disable
 using System;
@@ -82,6 +118,43 @@ namespace LPA
         * regardless of that LTS's own spacing radius.
         */
         private static Dictionary<string, HashSet<float>> _groupPartitions;
+
+        /**
+        * The m_groupMax system. One entry per distinct (key, radius) that some enabled type actually
+        * QUERIES; a type that only advertises (maxDistanceFromSimilar 0, like CharredFortress) never
+        * produces an entry, it just paints into other people's.
+        *
+        * Key mirrors the min side's group-or-prefab collapse: m_groupMax when set, prefab name otherwise.
+        * That collapse is exact here rather than approximate. Vanilla's max arm is an unconditional OR -
+        * "their prefab == my prefab, OR their m_groupMax == my m_groupMax" - and the prefab arm can only
+        * ever match instances of the querier's OWN prefab, which necessarily carry the querier's own
+        * m_groupMax. So whenever m_groupMax is set the prefab arm is a strict subset of the group arm and
+        * folding it away changes nothing. When m_groupMax is empty the prefab arm is all there is, and
+        * the key becomes the prefab name.
+        *
+        * Array, not a dictionary: it is walked per placement and it has one element on a vanilla world.
+        */
+        private struct MaxQuery
+        {
+            public string PrefabName;
+            public string GroupMax;
+            public float Radius;
+            public PresenceGrid Grid;
+        }
+        private static MaxQuery[] _maxQueries = new MaxQuery[0];
+
+        // Querying prefab --> the grid it reads. Resolved once per LTS, never in the dart loop.
+        private static Dictionary<string, PresenceGrid> _maxGridByPrefab;
+
+        /**
+        * Querying prefab --> the prefabs whose placements it needs to already exist. Only pure
+        * advertisers land here (types that are in the group but ask for nothing themselves), which is
+        * what makes the dependency acyclic by construction: a pure advertiser can never be waiting on
+        * anyone, so nothing can wait in a circle. A querier that is a member of its own group - which
+        * FortressRuins is, and has to be, or 20 hosts times 4 lattice slots caps it at 80 of the 100 the
+        * designer asked for - is deliberately NOT a dependency of itself. That chain is the re-walk's job.
+        */
+        private static Dictionary<string, List<string>> _maxHostsByPrefab;
 
         // Prefab name --> count of instances placed by CenterFirstPlacer.PlaceAll().
         // Used by the parallel path's DoFlushAndRelax to compute globalPlaced
@@ -274,6 +347,8 @@ namespace LPA
                 }
             }
 
+            BuildMaxSystem(zsP);
+
             List<string> centerFirstPlaced = CenterFirstPlacer.PlaceAll(zsP);
 
             _centerFirstCounts = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -292,6 +367,7 @@ namespace LPA
                     grp = instance.m_location.m_group;
                 }
                 CommitToGroup(grp, instance.m_position);
+                CommitMaxAdvertise(instance.m_location, instance.m_position);
             }
 
             yield return null;
@@ -325,7 +401,7 @@ namespace LPA
         */
         private static bool EvaluateZone(ZoneSystem zsP, ZoneLocation locP, Vector2i zoneIDP,
                                           PresenceGrid groupGridP, string groupP, PlacementCounters ctrP,
-                                          TelemetryContext telCtxP)
+                                          TelemetryContext telCtxP, PresenceGrid maxGridP)
         {
             Vector3 zonePos = ZoneSystem.GetZonePos(zoneIDP);
             int zoneGridIdx = -1;
@@ -386,6 +462,20 @@ namespace LPA
                     }
                 }
 
+                /**
+                * The mirror image of the check above, and the same single-bit read. The grid is painted at
+                * the querier's own radius by everything that advertises to its groupMax, so "a bit is set
+                * here" already means "a host is within range" - the radius does not appear again. Min
+                * rejects when the bit is SET, max rejects when it is CLEAR. Same machinery, same
+                * quantization, opposite sign. Vanilla runs min first then max and so do I; the ordering is
+                * free either way but there is no reason to diverge.
+                */
+                if (maxGridP != null && !maxGridP.HasConflict(p))
+                {
+                    ctrP.ErrNotSim++;
+                    continue;
+                }
+
                 if (locP.m_maxTerrainDelta > 0f || locP.m_minTerrainDelta > 0f)
                 {
                     ThreadSafeTerrainDelta.GetTerrainDelta(p, locP.m_exteriorRadius, out float delta, out _, zoneGridIdx);
@@ -412,6 +502,7 @@ namespace LPA
                     SurveyMode.MarkZoneOccupied(zoneGridIdx);
                 }
                 CommitToGroup(groupP, p);
+                CommitMaxAdvertise(locP, p);
                 ctrP.Placed++;
                 return true;
             }
@@ -473,6 +564,194 @@ namespace LPA
                 }
             }
             return false;
+        }
+
+        /**
+        * Builds the m_groupMax system: who queries, at what radius, and who they depend on.
+        * Runs once, over ~150 entries, before a single dart is thrown.
+        */
+        private static void BuildMaxSystem(ZoneSystem zsP)
+        {
+            List<MaxQuery> queries = new List<MaxQuery>();
+            _maxGridByPrefab = new Dictionary<string, PresenceGrid>(StringComparer.Ordinal);
+            _maxHostsByPrefab = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+
+            Dictionary<string, int> queryIndexByKey = new Dictionary<string, int>(StringComparer.Ordinal);
+
+            foreach (ZoneLocation loc in zsP.m_locations)
+            {
+                if (!loc.m_enable || !Compatibility.IsValidLocation(loc))
+                {
+                    continue;
+                }
+                if (loc.m_maxDistanceFromSimilar <= 0f)
+                {
+                    continue;
+                }
+
+                string groupMax = loc.m_groupMax;
+                if (groupMax == null)
+                {
+                    groupMax = string.Empty;
+                }
+
+                string key = loc.m_prefabName;
+                if (groupMax.Length > 0)
+                {
+                    key = groupMax;
+                }
+
+                string gridKey = $"MAX:{key}:{loc.m_maxDistanceFromSimilar:F0}";
+
+                bool hasQuery = queryIndexByKey.TryGetValue(gridKey, out int existingIndex);
+                if (!hasQuery)
+                {
+                    MaxQuery query = new MaxQuery
+                    {
+                        PrefabName = loc.m_prefabName,
+                        GroupMax = groupMax,
+                        Radius = loc.m_maxDistanceFromSimilar,
+                        Grid = PresenceGrid.GetOrCreate(gridKey)
+                    };
+                    existingIndex = queries.Count;
+                    queries.Add(query);
+                    queryIndexByKey[gridKey] = existingIndex;
+                }
+
+                _maxGridByPrefab[loc.m_prefabName] = queries[existingIndex].Grid;
+            }
+
+            _maxQueries = queries.ToArray();
+
+            if (_maxQueries.Length == 0)
+            {
+                return;
+            }
+
+            BuildMaxHosts(zsP);
+
+            if (ModConfig.DiagnosticMode.Value)
+            {
+                for (int i = 0; i < _maxQueries.Length; i++)
+                {
+                    string hostList = "none";
+                    if (_maxHostsByPrefab.TryGetValue(_maxQueries[i].PrefabName, out List<string> hosts) && hosts.Count > 0)
+                    {
+                        hostList = string.Join(",", hosts.ToArray());
+                    }
+                    DiagnosticLog.WriteTimestampedLog(
+                        $"[LPA] MAXQ prefab={_maxQueries[i].PrefabName} groupMax={_maxQueries[i].GroupMax} " +
+                        $"radius={_maxQueries[i].Radius:F0} hosts={hostList}");
+                }
+            }
+        }
+
+        /**
+        * For every querier, the pure advertisers it needs on the ground first. "Pure" is doing real work:
+        * a type that both advertises and queries is a chain link, not a host, and treating it as a
+        * dependency would let two queriers wait on each other. Excluding them means the wait graph has
+        * depth one and cannot cycle, which is why this needs no topological sort - which is also the
+        * whole reason I refused the tier graph the last time round.
+        */
+        private static void BuildMaxHosts(ZoneSystem zsP)
+        {
+            for (int i = 0; i < _maxQueries.Length; i++)
+            {
+                MaxQuery query = _maxQueries[i];
+                List<string> hosts = new List<string>();
+
+                foreach (ZoneLocation candidate in zsP.m_locations)
+                {
+                    if (!candidate.m_enable || !Compatibility.IsValidLocation(candidate) || candidate.m_quantity <= 0)
+                    {
+                        continue;
+                    }
+                    if (candidate.m_maxDistanceFromSimilar > 0f)
+                    {
+                        continue;
+                    }
+                    if (candidate.m_prefabName == query.PrefabName)
+                    {
+                        continue;
+                    }
+                    if (!AdvertisesTo(candidate, ref query))
+                    {
+                        continue;
+                    }
+                    if (hosts.Contains(candidate.m_prefabName))
+                    {
+                        continue;
+                    }
+                    hosts.Add(candidate.m_prefabName);
+                }
+
+                _maxHostsByPrefab[query.PrefabName] = hosts;
+            }
+        }
+
+        /**
+        * Vanilla's max arm, verbatim: their prefab == my prefab, OR their m_groupMax == my m_groupMax.
+        * The OR is unconditional in the original and stays unconditional here.
+        */
+        private static bool AdvertisesTo(ZoneLocation locP, ref MaxQuery queryP)
+        {
+            if (locP.m_prefabName == queryP.PrefabName)
+            {
+                return true;
+            }
+            if (queryP.GroupMax.Length > 0 && locP.m_groupMax == queryP.GroupMax)
+            {
+                return true;
+            }
+            return false;
+        }
+
+        // Null when this type has no max rule, which is 148 of 149 vanilla types.
+        private static PresenceGrid ResolveMaxGrid(ZoneLocation locP)
+        {
+            if (_maxQueries.Length == 0)
+            {
+                return null;
+            }
+            if (locP.m_maxDistanceFromSimilar <= 0f)
+            {
+                return null;
+            }
+            _maxGridByPrefab.TryGetValue(locP.m_prefabName, out PresenceGrid grid);
+            return grid;
+        }
+
+        public static List<string> GetMaxHostPrefabs(string prefabNameP)
+        {
+            if (_maxHostsByPrefab == null)
+            {
+                return null;
+            }
+            _maxHostsByPrefab.TryGetValue(prefabNameP, out List<string> hosts);
+            return hosts;
+        }
+
+        /**
+        * Paint a placement into every max grid it advertises to. Sits next to CommitToGroup at every
+        * commit site rather than inside it, because CommitToGroup is handed the resolved group STRING and
+        * this needs the location - m_groupMax and m_prefabName both.
+        *
+        * Length check first so a world with no max types pays one compare per placement.
+        */
+        private static void CommitMaxAdvertise(ZoneLocation locP, Vector3 pP)
+        {
+            MaxQuery[] queries = _maxQueries;
+            if (queries.Length == 0)
+            {
+                return;
+            }
+            for (int i = 0; i < queries.Length; i++)
+            {
+                if (AdvertisesTo(locP, ref queries[i]))
+                {
+                    queries[i].Grid.Commit(pP, queries[i].Radius);
+                }
+            }
         }
 
         // Rasterize a placement into all radius sub-grids for the group.
