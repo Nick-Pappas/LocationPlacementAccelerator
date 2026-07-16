@@ -1,4 +1,4 @@
-// v1.0.7
+// v1.0.9
 /**
 * Multi-threaded placement path for the replacement engine.
 *
@@ -22,6 +22,40 @@
 * in the log, making cross-thread races (e.g. the OccupiedZoneIndices HashSet
 * race fixed in WorldSurveyData v1.0.4) effectively undiagnosable.
 * That is why ashenius' report was making non sense at all.
+*
+* 1.0.8: Closed the min-distance race. The coloring was always sound - same-color blocks are >= minDist
+* apart by construction - but the dispatcher never honored it. Non-interleaved dumped every color of a GT
+* into the queue back to back, so workers pulled ADJACENT colors of the same group, and adjacent colors touch. 
+* Between HasConflict and CommitToGroup sits the rest of the dart's filters, a return, a quota claim
+* and a zone claim, and the only atomic claim in that window is _pendingOccupancy, which is keyed by zone
+* useless for two placements thirty metres apart across a zone boundary. Both workers read clear, both
+* committed. Rare, but real, and the reason two same-group locations occasionally sat far closer than their
+* radius allows.
+*
+* The fix is one rule: a GT never has two colors in flight at once. GtsStream carries InFlightWorkUnits,
+* raised as each unit is enqueued and dropped at the worker's completion point, and a stream only pushes its
+* next color once its current one has drained to zero. It is per-stream, so distinct GTs never wait on each
+* other and the first source of parallelism is untouched.
+*
+* That gate on its own would have cost the second source. One work unit per color means gating to one color
+* leaves the GT a single unit, so a single thread, and a fat group would run alone while nine workers idled -
+* exactly what spatial partitioning exists to prevent. So GetPartition now also hands back the block id, and
+* each color is coarsened into chunkCount = worker-count chunks (unsigned mod of the block id). Same-color
+* blocks are all >= minDist apart, so ANY grouping of them is safe: a chunk is one thread, and two chunks of
+* one color only ever hold same-color blocks. Coarsening rather than one-unit-per-block keeps the build
+* cheap - the unit count is colors * workers * subgroups, not colors * blocks.
+*
+* The dispatch is one round-robin that laps every stream each pass and yields only on the GUI cadence, never
+* because a pass happened to enqueue nothing. A stream mid-color is skipped, not waited on, so the pool
+* stays fed from the other GTs.
+*
+* ModConfig.ParallelExactSpacing turns the gate off: every color dumped at once, no barrier, AND the chunks
+* collapsed back to one unit per color. The collapse is not cosmetic. The emit is color-major, so with
+* chunks left in, the queue reads c0k0..c0kN before c1k0 and the pool drains a color before it can reach the
+* next one - the ordering alone keeps it safe and the switch would be a lie. One unit per color is what puts
+* ten adjacent colors of one group in front of ten workers. That is the pre-fix engine exactly, race
+* included. It exists so the cost of the guarantee can be measured rather than argued about, and it defaults
+* to ON because the guarantee is the point.
 *
 * Architecture overview:
 *   1. BuildSpatialStreams groups location types by GTS (similarity group),
@@ -50,6 +84,7 @@
 *   
 *   Almost made me rename the mod from LPA to PIA.
 *   God class, with lots of god methods. Enjoy, me reading this a year from now.
+*   
 */
 #nullable disable
 using System;
@@ -107,11 +142,26 @@ namespace LPA
         /**
         * A spatial region of a GT. Contains per-type zone sublists.
         * Workers process TypeWork entries sequentially (sieve order),then pull the next WorkUnit from the queue.
+        *
+        * OwnerStream is how a worker finds the counter to drop when it is done. The queue hands out units with
+        * no memory of where they came from, and the color gate lives on the stream, so the unit has to carry
+        * the way back.
         */
         private class WorkUnit
         {
             public List<TypeRegionWork> TypeWork;
             public bool IsPrioritized;
+            public GtsStream OwnerStream;
+        }
+
+        /**
+        * Every work unit of one color of one sub-group. These run together: the geometry guarantees that any
+        * two blocks of the same color are at least minDist apart, so no two of these units can produce a
+        * conflicting pair no matter how the pool interleaves them. It is only the NEXT color that has to wait.
+        */
+        private class ColorBatch
+        {
+            public List<WorkUnit> WorkUnits;
         }
 
         private class TypeRegionWork
@@ -135,12 +185,21 @@ namespace LPA
             public List<SubGroupStream> SubGroups;
             public int CurrentSubGroup;
             public bool IsPrioritized;
+
+            /**
+            * Work units of this stream that are queued or running. The dispatcher will not open the next color
+            * until this reads zero, which is what keeps two colors of one GT from ever being concurrent.
+            * No volatile keyword: it triggers CS0420 when passed to Interlocked by ref. Volatile.Read on the
+            * dispatcher side gives the same acquire semantics without the warning.
+            */
+            public int InFlightWorkUnits;
         }
 
         private class SubGroupStream
         {
             public float MinDistFromSimilar;
-            public Queue<WorkUnit> WorkUnits;
+            public List<ColorBatch> Colors;
+            public int CurrentColorIndex;
         }
 
         private static IEnumerator RunParallelPath(ZoneSystem zsP, int locListSnapshotP)
@@ -235,13 +294,41 @@ namespace LPA
                 workerTasks[w] = Task.Run(() => WorkerBody(zsP, idx));
             }
 
-            bool crossedPriority = false;
             const long YieldIntervalMs = 100;// works well in the mt case. 
             Stopwatch yieldSw = Stopwatch.StartNew();
 
-            if (_interleavedScheduling)
+            /**
+            * One dispatch for both scheduling modes. The interleaved flag drives the sequential path's token
+            * model; it has no business forking this, because the right way to feed the pool is the same either
+            * way - hand distinct GTs to distinct threads, and let a GT spread across the leftovers by its own
+            * chunks when it is the only one left.
+            *
+            * exactSpacing OFF is the pre-fix engine: every color of every stream dumped at once, no gate. Two
+            * adjacent colors of one GT then run concurrently and the min-distance race is live again. It is
+            * here to be measured against, not to be shipped.
+            */
+            bool exactSpacing = ModConfig.ParallelExactSpacing.Value;
+
+            if (!exactSpacing)
             {
-                // Phase 1: round-robin prioritized streams until exhausted.
+                DumpStreams(gtsStreams, true);
+
+                while (!_priorityBarrierDone.IsSet)
+                {
+                    DrainAndCommit(zsP);
+                    UpdateAnnulus(zsP);
+                    if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs)
+                    {
+                        yieldSw.Restart();
+                        yield return null;
+                    }
+                }
+
+                DumpStreams(gtsStreams, false);
+            }
+            else
+            {
+                // Phase 1: prioritized streams, color-gated.
                 bool anyPrio = true;
                 while (anyPrio)
                 {
@@ -252,31 +339,25 @@ namespace LPA
                         {
                             continue;
                         }
-                        if (stream.CurrentSubGroup >= stream.SubGroups.Count)
+                        if (PushNextColor(stream))
                         {
-                            continue;
+                            anyPrio = true;
                         }
-                        SubGroupStream csg = stream.SubGroups[stream.CurrentSubGroup];
-                        if (csg.WorkUnits.Count == 0)
-                        {
-                            stream.CurrentSubGroup++;
-                            if (stream.CurrentSubGroup < stream.SubGroups.Count)
-                            {
-                                anyPrio = true;
-                            }
-                            continue;
-                        }
+                    }
 
-                        int batch = 1;
-                        if (stream.SubGroups.Count > 1)
-                        {
-                            batch = Math.Min(_parallelThreadCount, csg.WorkUnits.Count);
-                        }
-                        for (int b = 0; b < batch && csg.WorkUnits.Count > 0; b++)
-                        {
-                            _workQueue.Add(csg.WorkUnits.Dequeue());
-                        }
-                        anyPrio = true;
+                    /**
+                    * Spin on the commit work rather than on a frame. A pass that enqueues nothing means every
+                    * stream is mid-color, and yielding there costs a whole Unity frame - the workers drain a
+                    * color in a millisecond or two and then the pool starves until the next frame lets me
+                    * notice. So I only yield on the GUI cadence and spend the wait committing placements the
+                    * workers have already produced.
+                    */
+                    DrainAndCommit(zsP);
+                    UpdateAnnulus(zsP);
+                    if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs)
+                    {
+                        yieldSw.Restart();
+                        yield return null;
                     }
                 }
 
@@ -292,7 +373,7 @@ namespace LPA
                     }
                 }
 
-                // Phase 2: round-robin non-prioritized streams.
+                // Phase 2: non-prioritized streams, same gate.
                 bool anyLeft = true;
                 while (anyLeft)
                 {
@@ -303,59 +384,18 @@ namespace LPA
                         {
                             continue;
                         }
-                        if (stream.CurrentSubGroup >= stream.SubGroups.Count)
+                        if (PushNextColor(stream))
                         {
-                            continue;
+                            anyLeft = true;
                         }
-                        SubGroupStream csg = stream.SubGroups[stream.CurrentSubGroup];
-                        if (csg.WorkUnits.Count == 0)
-                        {
-                            stream.CurrentSubGroup++;
-                            if (stream.CurrentSubGroup < stream.SubGroups.Count)
-                            {
-                                anyLeft = true;
-                            }
-                            continue;
-                        }
+                    }
 
-                        int batch = 1;
-                        if (stream.SubGroups.Count > 1)
-                        {
-                            batch = Math.Min(_parallelThreadCount, csg.WorkUnits.Count);
-                        }
-                        for (int b = 0; b < batch && csg.WorkUnits.Count > 0; b++)
-                        {
-                            _workQueue.Add(csg.WorkUnits.Dequeue());
-                        }
-                        anyLeft = true;
-                    }
-                }
-            }
-            else
-            {
-                // Non-interleaved: exhaust each stream completely before moving on.
-                foreach (GtsStream stream in gtsStreams)
-                {
-                    if (!crossedPriority && !stream.IsPrioritized)
+                    DrainAndCommit(zsP);
+                    UpdateAnnulus(zsP);
+                    if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs)
                     {
-                        crossedPriority = true;
-                        while (!_priorityBarrierDone.IsSet)
-                        {
-                            DrainAndCommit(zsP);
-                            UpdateAnnulus(zsP);
-                            if (yieldSw.ElapsedMilliseconds >= YieldIntervalMs)
-                            {
-                                yieldSw.Restart();
-                                yield return null;
-                            }
-                        }
-                    }
-                    foreach (SubGroupStream sg in stream.SubGroups)
-                    {
-                        while (sg.WorkUnits.Count > 0)
-                        {
-                            _workQueue.Add(sg.WorkUnits.Dequeue());
-                        }
+                        yieldSw.Restart();
+                        yield return null;
                     }
                 }
             }
@@ -480,6 +520,78 @@ namespace LPA
         * in SpatialPartitionAlgorithms.
         * 
         */
+        /**
+        * Advances one stream by at most one color. Returns true while the stream still owes work - either it
+        * has colors left or it has units in flight - which is what keeps the dispatcher lapping.
+        *
+        * The gate is the whole fix: I refuse to open the next color while the current one is still out. Two
+        * colors of one GT are adjacent in space, so running them together is the race. Two BLOCKS of one
+        * color are >= minDist apart, so running those together is free, and that is why the whole batch goes
+        * in at once.
+        *
+        * The counter goes up BEFORE the unit is queued. A worker can pull and finish a unit between the two,
+        * and if the increment trailed the enqueue the counter could read zero with work still live and I would
+        * open the next color straight into the race I am trying to close.
+        */
+        private static bool PushNextColor(GtsStream streamP)
+        {
+            bool streamHasColorsLeft = streamP.CurrentSubGroup < streamP.SubGroups.Count;
+            bool streamHasUnitsInFlight = Volatile.Read(ref streamP.InFlightWorkUnits) > 0;
+
+            if (!streamHasColorsLeft && !streamHasUnitsInFlight)
+            {
+                return false;
+            }
+            if (streamHasUnitsInFlight)
+            {
+                return true;
+            }
+
+            SubGroupStream currentSubGroup = streamP.SubGroups[streamP.CurrentSubGroup];
+            if (currentSubGroup.CurrentColorIndex >= currentSubGroup.Colors.Count)
+            {
+                /**
+                * Sub-groups are landlord-first, and the same gate that separates colors separates them: the
+                * next sub-group only opens once the previous one is fully drained, so a small-radius tenant can
+                * never claim ground while its landlord is still placing.
+                */
+                streamP.CurrentSubGroup++;
+                return true;
+            }
+
+            ColorBatch batch = currentSubGroup.Colors[currentSubGroup.CurrentColorIndex];
+            for (int w = 0; w < batch.WorkUnits.Count; w++)
+            {
+                Interlocked.Increment(ref streamP.InFlightWorkUnits);
+                _workQueue.Add(batch.WorkUnits[w]);
+            }
+            currentSubGroup.CurrentColorIndex++;
+            return true;
+        }
+
+        // The ungated path: everything at once, colors of a GT concurrent, race live. Kept only as the baseline to measure the gate against.
+        private static void DumpStreams(List<GtsStream> streamsP, bool prioritizedP)
+        {
+            foreach (GtsStream stream in streamsP)
+            {
+                if (stream.IsPrioritized != prioritizedP)
+                {
+                    continue;
+                }
+                foreach (SubGroupStream sg in stream.SubGroups)
+                {
+                    foreach (ColorBatch batch in sg.Colors)
+                    {
+                        for (int w = 0; w < batch.WorkUnits.Count; w++)
+                        {
+                            Interlocked.Increment(ref stream.InFlightWorkUnits);
+                            _workQueue.Add(batch.WorkUnits[w]);
+                        }
+                    }
+                }
+            }
+        }
+
         private static List<GtsStream> BuildSpatialStreams(List<OrderedEntry> orderedP)
         {
             // Group entries by GT, preserving list order.
@@ -547,9 +659,32 @@ namespace LPA
                     PartitionRule rule = SpatialPartitionAlgorithms.BuildRule(sgMinDist, _parallelThreadCount);
                     int partitionCount = rule.PartitionCount;
 
-                    // Build per-partition, per-type zone sublists. Candidate fetch + inline partition computation in one pass.
-                    Dictionary<string, List<Vector2i>>[] partitions = new Dictionary<string, List<Vector2i>>[partitionCount];
-                    for (int p = 0; p < partitionCount; p++)
+                    /**
+                    * A color is split into as many chunks as I have workers, and no further. One unit per block
+                    * would be the obvious read of the geometry, but it buys nothing: I only need enough units to
+                    * saturate the pool, and it would explode the build (thousands of units, each with its own list
+                    * and counters, all allocated single-threaded before a single dart is thrown). Coarsening is
+                    * free of risk because same-color blocks are mutually >= minDist, so any partition of them into
+                    * chunks is safe - a chunk runs on one thread, and two chunks of a color only ever hold
+                    * same-color blocks.
+                    *
+                    * Ungated mode collapses that to one unit per color. It has to: the emit below is color-major,
+                    * so with chunks the queue reads c0k0..c0kN, c1k0..c1kN and the pool drains a whole color before
+                    * it ever reaches the next one - the ordering does the gate's job by accident and nothing races.
+                    * One unit per color puts ten DIFFERENT colors of one group in front of ten workers, and
+                    * adjacent colors touch. That is the pre-fix engine, and reproducing it exactly is the only
+                    * reason this branch exists.
+                    */
+                    int chunkCount = Math.Max(1, _parallelThreadCount);
+                    if (!ModConfig.ParallelExactSpacing.Value)
+                    {
+                        chunkCount = 1;
+                    }
+                    int bucketCount = partitionCount * chunkCount;
+
+                    // Build per-bucket, per-type zone sublists. Candidate fetch + inline partition computation in one pass.
+                    Dictionary<string, List<Vector2i>>[] partitions = new Dictionary<string, List<Vector2i>>[bucketCount];
+                    for (int p = 0; p < bucketCount; p++)
                     {
                         partitions[p] = new Dictionary<string, List<Vector2i>>(StringComparer.Ordinal);
                     }
@@ -563,12 +698,15 @@ namespace LPA
 
                         foreach (Vector2i zone in candidates)
                         {
-                            int partition = SpatialPartitionAlgorithms.GetPartition(zone, ref rule);
-                            bool hasZoneList = partitions[partition].TryGetValue(prefabName, out List<Vector2i> zoneList);
+                            SpatialPartitionAlgorithms.GetPartition(zone, ref rule, out int colorIndex, out int blockId);
+                            // Unsigned so the block id's sign bit folds into the range instead of producing a negative chunk.
+                            int chunk = (int)((uint)blockId % (uint)chunkCount);
+                            int bucket = colorIndex * chunkCount + chunk;
+                            bool hasZoneList = partitions[bucket].TryGetValue(prefabName, out List<Vector2i> zoneList);
                             if (!hasZoneList)
                             {
                                 zoneList = new List<Vector2i>();
-                                partitions[partition][prefabName] = zoneList;
+                                partitions[bucket][prefabName] = zoneList;
                             }
                             zoneList.Add(zone);
                         }
@@ -587,7 +725,7 @@ namespace LPA
                     {
                         string prefabName = entry.Loc.m_prefabName;
                         int regionCount = 0;
-                        for (int p = 0; p < partitionCount; p++)
+                        for (int p = 0; p < bucketCount; p++)
                         {
                             bool hasZones = partitions[p].TryGetValue(prefabName, out List<Vector2i> zoneList);
                             if (hasZones && zoneList.Count > 0)
@@ -603,46 +741,70 @@ namespace LPA
                     SubGroupStream sgs = new SubGroupStream
                     {
                         MinDistFromSimilar = sgMinDist,
-                        WorkUnits = new Queue<WorkUnit>()
+                        Colors = new List<ColorBatch>(),
+                        CurrentColorIndex = 0
                     };
 
-                    for (int p = 0; p < partitionCount; p++)
+                    for (int c = 0; c < partitionCount; c++)
                     {
-                        List<TypeRegionWork> typeWork = new List<TypeRegionWork>();
+                        ColorBatch batch = new ColorBatch { WorkUnits = new List<WorkUnit>() };
 
-                        foreach (OrderedEntry entry in sgEntries)
+                        for (int k = 0; k < chunkCount; k++)
                         {
-                            string prefabName = entry.Loc.m_prefabName;
-                            bool hasZones = partitions[p].TryGetValue(prefabName, out List<Vector2i> zones);
-                            if (!hasZones || zones.Count == 0)
+                            int bucket = c * chunkCount + k;
+                            List<TypeRegionWork> typeWork = new List<TypeRegionWork>();
+
+                            foreach (OrderedEntry entry in sgEntries)
                             {
-                                continue;
+                                string prefabName = entry.Loc.m_prefabName;
+                                bool hasZones = partitions[bucket].TryGetValue(prefabName, out List<Vector2i> zones);
+                                if (!hasZones || zones.Count == 0)
+                                {
+                                    continue;
+                                }
+
+                                PlacementCounters ctr = new PlacementCounters();
+                                TelemetryContext telCtx = new TelemetryContext();
+                                _counterLists[prefabName].Add(ctr);
+                                _telemetryLists[prefabName].Add(telCtx);
+
+                                typeWork.Add(new TypeRegionWork
+                                {
+                                    Loc = entry.Loc,
+                                    Group = grpKey,
+                                    Grid = grid,
+                                    Zones = zones,
+                                    Counters = ctr,
+                                    TelCtx = telCtx
+                                });
                             }
 
-                            PlacementCounters ctr = new PlacementCounters();
-                            TelemetryContext telCtx = new TelemetryContext();
-                            _counterLists[prefabName].Add(ctr);
-                            _telemetryLists[prefabName].Add(telCtx);
-
-                            typeWork.Add(new TypeRegionWork
+                            if (typeWork.Count > 0)
                             {
-                                Loc = entry.Loc,
-                                Group = grpKey,
-                                Grid = grid,
-                                Zones = zones,
-                                Counters = ctr,
-                                TelCtx = telCtx
-                            });
+                                batch.WorkUnits.Add(new WorkUnit
+                                {
+                                    TypeWork = typeWork,
+                                    IsPrioritized = stream.IsPrioritized,
+                                    OwnerStream = stream
+                                });
+                            }
                         }
 
-                        if (typeWork.Count > 0)
+                        if (batch.WorkUnits.Count > 0)
                         {
-                            sgs.WorkUnits.Enqueue(new WorkUnit
-                            {
-                                TypeWork = typeWork,
-                                IsPrioritized = stream.IsPrioritized
-                            });
+                            sgs.Colors.Add(batch);
                         }
+                    }
+
+                    /**
+                    * A sub-group with no candidates anywhere still needs one batch to exist, because the sentinel
+                    * for a zero-candidate type is attached to the first color of the first sub-group and its
+                    * flush is what releases the priority barrier. Dropping the empty batch starves the sentinel
+                    * and the barrier never opens.
+                    */
+                    if (sgs.Colors.Count == 0)
+                    {
+                        sgs.Colors.Add(new ColorBatch { WorkUnits = new List<WorkUnit>() });
                     }
 
                     stream.SubGroups.Add(sgs);
@@ -658,14 +820,17 @@ namespace LPA
             {
                 foreach (SubGroupStream sg in s.SubGroups)
                 {
-                    foreach (WorkUnit wu in sg.WorkUnits)
+                    foreach (ColorBatch batch in sg.Colors)
                     {
-                        foreach (TypeRegionWork tw in wu.TypeWork)
+                        foreach (WorkUnit wu in batch.WorkUnits)
                         {
-                            totalZones += tw.Zones.Count;
-                            string prefabName = tw.Loc.m_prefabName;
-                            prefabZones.TryGetValue(prefabName, out int cur);
-                            prefabZones[prefabName] = cur + tw.Zones.Count;
+                            foreach (TypeRegionWork tw in wu.TypeWork)
+                            {
+                                totalZones += tw.Zones.Count;
+                                string prefabName = tw.Loc.m_prefabName;
+                                prefabZones.TryGetValue(prefabName, out int cur);
+                                prefabZones[prefabName] = cur + tw.Zones.Count;
+                            }
                         }
                     }
                 }
@@ -708,6 +873,16 @@ namespace LPA
                     PresenceGrid grid = PresenceGrid.GetOrCreate(
                         $"{grp}:{entry.Loc.m_minDistanceFromSimilar:F0}");
 
+                    GtsStream targetStream = null;
+                    for (int i = 0; i < streams.Count; i++)
+                    {
+                        if (streams[i].GroupKey == grpKey)
+                        {
+                            targetStream = streams[i];
+                            break;
+                        }
+                    }
+
                     //I have to say this looks horrible...
                     WorkUnit sentinelWu = new WorkUnit
                     {
@@ -723,21 +898,13 @@ namespace LPA
                                 TelCtx = sentinelTel
                             }
                         },
-                        IsPrioritized = entry.Loc.m_prioritized
+                        IsPrioritized = entry.Loc.m_prioritized,
+                        OwnerStream = targetStream
                     };
 
-                    GtsStream targetStream = null;
-                    for (int i = 0; i < streams.Count; i++)
-                    {
-                        if (streams[i].GroupKey == grpKey)
-                        {
-                            targetStream = streams[i];
-                            break;
-                        }
-                    }
                     if (targetStream != null && targetStream.SubGroups.Count > 0)
                     {
-                        targetStream.SubGroups[0].WorkUnits.Enqueue(sentinelWu);
+                        targetStream.SubGroups[0].Colors[0].WorkUnits.Add(sentinelWu);
                     }
                 }
             }
@@ -793,6 +960,16 @@ namespace LPA
                             }
                         }
                     }
+                }
+
+                /**
+                * The color is only done when the last unit of it is done, so this drops after every TypeWork in
+                * the unit has been walked - including the flush, which can still be reading grids the next color
+                * would otherwise start writing.
+                */
+                if (unit.OwnerStream != null)
+                {
+                    Interlocked.Decrement(ref unit.OwnerStream.InFlightWorkUnits);
                 }
 
                 GenerationProgress.SetThreadSlot(workerIdxP, null);

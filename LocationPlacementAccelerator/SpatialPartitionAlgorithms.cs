@@ -1,4 +1,4 @@
-// v1
+// v2
 /**
 * Spatial partitioning for the replaced parallel placement engine.
 *
@@ -40,6 +40,14 @@
 * 
 * TODO: I should add my wedge partitioning algorithm here to compare. 
 * But it may be more work to debug, to end up making 4.6s to 4.3s...
+*
+* v2: GetPartition now yields the block id alongside the color. The color on its own is what PROVES safety
+* (same-color blocks are >= minDist apart), but it is not enough to keep the pool fed once the dispatcher
+* only lets one color of a GT run at a time: that leaves the GT exactly one work unit, so one thread, and
+* the second source of parallelism - splitting a group across space - disappears. The block id is what brings
+* it back. Any grouping of same-color blocks is mutually >= minDist, so the caller is free to coarsen blocks
+* into as many chunks as it has workers and run them all concurrently inside one color. I return the raw
+* block id rather than a chunk id because the chunk count is the caller's business, not the geometry's.
 */
 #nullable disable
 using System;
@@ -152,7 +160,7 @@ namespace LPA
         }
 
         /**
-        * Maps a zone coordinate to its partition index. O(1) arithmetic.
+        * Maps a zone coordinate to its color and to the block that color came from. O(1) arithmetic.
         *
         * Called once per zone during BuildSpatialStreams (~50k zones per GT). Inlined to eliminate call overhead on that warm path.
         *
@@ -164,29 +172,57 @@ namespace LPA
         *
         * Modulo tier:
         *   Same logic but uses FloorDiv and FloorMod for arbitrary K and C.
+        *
+        * The block id is the block coordinate the color was derived from, packed into one int. The caller
+        * needs it to spread one color across several threads; the geometry only guarantees that same-color
+        * blocks are >= minDist apart, and that guarantee is what makes any such spread safe.
         */
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static int GetPartition(Vector2i zoneP, ref PartitionRule ruleP)
+        public static void GetPartition(Vector2i zoneP, ref PartitionRule ruleP, out int colorIndexP, out int blockIdP)
         {
             switch (ruleP.Mode)
             {
                 case PartitionMode.BitShift:
-                {
-                    int colorX = (zoneP.x >> ruleP.BlockSizeLog2) & ruleP.ColorMask;
-                    int colorZ = (zoneP.y >> ruleP.BlockSizeLog2) & ruleP.ColorMask;
-                    return colorX | (colorZ << ruleP.ColorBits);
-                }
+                    {
+                        int blockX = zoneP.x >> ruleP.BlockSizeLog2;
+                        int blockZ = zoneP.y >> ruleP.BlockSizeLog2;
+                        int colorX = blockX & ruleP.ColorMask;
+                        int colorZ = blockZ & ruleP.ColorMask;
+                        colorIndexP = colorX | (colorZ << ruleP.ColorBits);
+                        blockIdP = PackBlockId(blockX, blockZ);
+                        return;
+                    }
 
                 case PartitionMode.Modulo:
-                {
-                    int colorX = FloorMod(FloorDiv(zoneP.x, ruleP.BlockSize), ruleP.ColorsPerAxis);
-                    int colorZ = FloorMod(FloorDiv(zoneP.y, ruleP.BlockSize), ruleP.ColorsPerAxis);
-                    return colorX * ruleP.ColorsPerAxis + colorZ;
-                }
+                    {
+                        int blockX = FloorDiv(zoneP.x, ruleP.BlockSize);
+                        int blockZ = FloorDiv(zoneP.y, ruleP.BlockSize);
+                        int colorX = FloorMod(blockX, ruleP.ColorsPerAxis);
+                        int colorZ = FloorMod(blockZ, ruleP.ColorsPerAxis);
+                        colorIndexP = colorX * ruleP.ColorsPerAxis + colorZ;
+                        blockIdP = PackBlockId(blockX, blockZ);
+                        return;
+                    }
 
                 default:
-                    return 0;
+                    colorIndexP = 0;
+                    blockIdP = 0;
+                    return;
             }
+        }
+
+        /**
+        * Packs a 2D block coordinate into a single int so the caller can derive a chunk with one modulo.
+        *
+        * The two fields do not overlap, so the packing is injective: two distinct blocks can never collapse
+        * onto the same id, which is the only property the caller's chunking depends on for safety. Block
+        * coordinates stay well inside 16 bits for any world I support - a 50km world at block size 1 is
+        * +-781 blocks - so the low field never spills into the high one.
+        */
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int PackBlockId(int blockXP, int blockZP)
+        {
+            return (blockXP & 0xFFFF) | (blockZP << 16);
         }
 
         /**

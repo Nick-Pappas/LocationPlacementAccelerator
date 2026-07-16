@@ -1,4 +1,4 @@
-// v1.2
+// v1.3
 /**
 * Static configuration holder for Location Placement Accelerator.
 * All config entries, effective runtime values, and shared mod state live here.
@@ -13,11 +13,14 @@
 * legacy) evaluated against the already-overwritten Mode and never fired.
 * Rewrote as two rules with explicit ordering: (1) Vanilla/Filter/Force
 * always force the transpiled engine, (2) Parallel forces the replaced
-* engine ONLY when Mode is Survey. The user's explicit Mode choice now
-* wins.
+* engine ONLY when Mode is Survey. The user's explicit Mode choice now wins.
 * Parallel becomes a no-op (logged) when Mode is incompatible.
 * 
 * This becomes  confusing maybe I should just simplify it or make presets like in BC, and that is that.
+* 
+* 1.3 Added the exact spacing config, which I should... remove?? I mean the difference is within noise at this point.
+* So allowing the racy placement for a potential 0.1s may not be worth it. Also makes stuff confusing for the users.
+* 
 */
 #nullable disable
 using BepInEx.Configuration;
@@ -62,6 +65,7 @@ namespace LPA
         public static ConfigEntry<float> PresenceGridCellSize;
         public static ConfigEntry<bool> Enable3DSimilarityCheck;
         public static ConfigEntry<bool> OptimizePlacementChecks;
+        public static ConfigEntry<bool> ParallelExactSpacing;
 
         public static float WorldRadius = 10000f;//the vanilla world radius which I realize I am defining every other file. 
 
@@ -277,6 +281,21 @@ namespace LPA
                 "\n" +
                 "Both optimizations are correctness-neutral: placement results are identical to\n" +
                 "unmodified Valheim. Leave ON unless benchmarking against true vanilla.");
+
+            ParallelExactSpacing = configP.Bind("7 - Advanced", "ParallelExactSpacing", false,
+                "Only applies to the parallel (multi-threaded) replaced engine.\n" +
+                "\n" +
+                "OFF by default. When OFF, each similarity color is dispatched as a single work unit and all\n" +
+                "colors are handed out at once, so several threads place one group in parallel. This is fast and\n" +
+                "is how the engine has always behaved; the only cost is that two same-group locations may VERY\n" +
+                "rarely spawn slightly closer than minDistanceFromSimilar right at a partition boundary.\n" +
+                "\n" +
+                "When ON, each color is further split into spatially-separated blocks and a barrier holds each\n" +
+                "color until it finishes before the next begins, which guarantees minDistanceFromSimilar is\n" +
+                "respected exactly under multithreading. This adds a one-time build cost (can exceed a second on\n" +
+                "large modded worlds) and lowers throughput. Turn ON only if exact spacing matters to you.\n" +
+                "\n" +
+                "NOTE: Changing this requires a full game restart.");
 
             /**
             * Purge obsolete config keys from previous versions so the .cfg file
